@@ -26,6 +26,8 @@ DB_PATH = STATE_DIR / "jobs.sqlite3"
 BOARDS_PATH = STATE_DIR / "ats_boards.json"
 ATS_BATCH_SIZE = 200
 AGGREGATOR_INTERVAL_SECONDS = 15 * 60
+HEARTBEAT_EXPECTED_SECONDS = 5 * 60
+HEARTBEAT_GRACE_SECONDS = 10 * 60
 SUPPORTED_PROVIDERS = {"ashby", "greenhouse", "lever", "lever-eu", "smartrecruiters"}
 JOB_FAMILY_TERMS = (
     "software engineer",
@@ -246,6 +248,10 @@ def connect_db() -> sqlite3.Connection:
     connection.execute(
         "CREATE TABLE IF NOT EXISTS source_checks "
         "(source TEXT PRIMARY KEY, last_checked INTEGER NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS heartbeat "
+        "(id INTEGER PRIMARY KEY CHECK (id = 1), last_run INTEGER NOT NULL)"
     )
     return connection
 
@@ -620,6 +626,34 @@ def fetch_due_aggregators(
     return results
 
 
+def heartbeat_message(
+    connection: sqlite3.Connection, now: int
+) -> tuple[str, int | None]:
+    row = connection.execute("SELECT last_run FROM heartbeat WHERE id = 1").fetchone()
+    if not row:
+        return "Heartbeat initialized", None
+    last_run = int(row[0])
+    gap = now - last_run
+    if gap > HEARTBEAT_GRACE_SECONDS:
+        return (
+            f"Heartbeat gap detected: last run was {gap // 60} minutes ago "
+            f"(expected every {HEARTBEAT_EXPECTED_SECONDS // 60} minutes)",
+            last_run,
+        )
+    return (
+        f"Heartbeat OK: last run was {max(gap // 60, 0)} minutes ago",
+        last_run,
+    )
+
+
+def record_heartbeat(connection: sqlite3.Connection, now: int) -> None:
+    connection.execute(
+        "INSERT INTO heartbeat(id, last_run) VALUES (1, ?) "
+        "ON CONFLICT(id) DO UPDATE SET last_run=excluded.last_run",
+        (now,),
+    )
+
+
 def fetch_direct_batch(
     boards: list[dict],
 ) -> tuple[list[tuple[dict, list[dict]]], list[dict]]:
@@ -738,6 +772,13 @@ def main() -> int:
         raise RuntimeError("No approved ATS boards are configured")
     with connect_db() as connection:
         checked_at = int(time.time())
+        heartbeat, last_run = heartbeat_message(connection, checked_at)
+        print(heartbeat)
+        if last_run is not None and checked_at - last_run > HEARTBEAT_GRACE_SECONDS:
+            print(
+                f"job-watcher: missed at least one 5-minute run; gap={checked_at - last_run}s",
+                file=sys.stderr,
+            )
         due_boards = select_due_boards(connection, boards, checked_at)
         direct_results, failed_boards = fetch_direct_batch(due_boards)
         aggregator_results = fetch_due_aggregators(connection, checked_at)
@@ -774,6 +815,7 @@ def main() -> int:
         if new_jobs and "--initialize" not in sys.argv:
             send_email(new_jobs)
         record_jobs(connection, new_jobs)
+        record_heartbeat(connection, checked_at)
     print(
         f"Selected {len(due_boards)} ATS boards; checked {len(direct_results)}; "
         f"failed {len(failed_boards)}; aggregators {len(aggregator_results)}; "

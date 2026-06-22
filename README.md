@@ -2,7 +2,8 @@
 
 Checks approved employer ATS boards every five minutes and emails new US and
 US-remote entry-level technical roles that explicitly offer sponsorship. SQLite
-state prevents duplicate mail.
+state prevents duplicate mail and records a heartbeat so missed runs are visible
+in the logs.
 
 The watcher polls a reviewed registry of employer career boards through public
 Greenhouse, Lever, Ashby, and SmartRecruiters APIs. Each run checks up to 200 due

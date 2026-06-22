@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from job_watcher import (
     canonical_url,
+    heartbeat_message,
     fetch_adzuna_jobs,
     description_offers_sponsorship,
     fetch_direct_board,
@@ -147,6 +148,25 @@ class MatchTests(unittest.TestCase):
             for index in range(250)
         ]
         self.assertEqual(len(select_due_boards(connection, boards, now=1000)), 200)
+
+    def test_heartbeat_initializes_on_first_run(self):
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            "CREATE TABLE heartbeat (id INTEGER PRIMARY KEY CHECK (id = 1), last_run INTEGER NOT NULL)"
+        )
+        message, last_run = heartbeat_message(connection, now=1000)
+        self.assertEqual(message, "Heartbeat initialized")
+        self.assertIsNone(last_run)
+
+    def test_heartbeat_reports_missed_runs(self):
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            "CREATE TABLE heartbeat (id INTEGER PRIMARY KEY CHECK (id = 1), last_run INTEGER NOT NULL)"
+        )
+        connection.execute("INSERT INTO heartbeat VALUES (1, 0)")
+        message, last_run = heartbeat_message(connection, now=1200)
+        self.assertIn("Heartbeat gap detected", message)
+        self.assertEqual(last_run, 0)
 
     @patch("job_watcher.fetch_json")
     def test_adzuna_normalization(self, fetch_json):
