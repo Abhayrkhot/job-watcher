@@ -9,6 +9,7 @@ from job_watcher import (
     description_mentions_citizenship_requirement,
     fetch_direct_board,
     fetch_jooble_jobs,
+    experience_summary,
     matches,
     select_due_boards,
 )
@@ -85,6 +86,15 @@ class MatchTests(unittest.TestCase):
     def test_canonicalizes_application_url(self):
         job = {"url": "https://jobs.ashbyhq.com/Acme/123/application?utm_source=test"}
         self.assertEqual(canonical_url(job), "https://jobs.ashbyhq.com/Acme/123")
+
+    def test_experience_summary(self):
+        self.assertEqual(experience_summary(self.job("Software Engineer - New Grad")), "New grad / entry level")
+        self.assertEqual(experience_summary(self.job(
+            "Software Engineer", description="0-2 years of experience required."
+        )), "0-2 years")
+        self.assertEqual(experience_summary(self.job(
+            "Software Engineer", description="General responsibilities."
+        )), "Entry level")
 
     @patch("job_watcher.fetch_json")
     def test_smartrecruiters_normalization(self, fetch_json):

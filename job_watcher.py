@@ -357,6 +357,23 @@ def plain_text(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", decoded)).strip()
 
 
+def experience_summary(job: dict) -> str:
+    title = str(job.get("title", "")).lower()
+    description = str(job.get("description", "")).lower()
+    text = f"{title} {description}"
+    if any(term in text for term in ("new grad", "new graduate", "graduate", "entry level", "entry-level", "early career", "campus hire")):
+        return "New grad / entry level"
+    match = re.search(
+        r"\b(?:0\s*(?:-|to)\s*2|1\s*(?:-|to)\s*2|2\s*(?:-|to)\s*4)\s*years?\b",
+        text,
+    )
+    if match:
+        return match.group(0).replace("  ", " ")
+    if "junior" in text or "associate" in text or "i" in title.split():
+        return "Junior / entry level"
+    return "Entry level"
+
+
 def company_from_slug(slug: str) -> str:
     return re.sub(r"[-_]+", " ", slug).title()
 
@@ -678,32 +695,52 @@ def send_email(jobs: list[dict]) -> None:
         raise RuntimeError("JOB_WATCHER_TO is not configured")
     subject = f"{len(jobs)} new US tech job{'s' if len(jobs) != 1 else ''}"
     rows = []
+    text_rows = ["Role | Company | Experience | Apply", "-" * 72]
     for job in jobs:
-        locations = ", ".join(job.get("locations") or ["Location not listed"])
-        source = str(job.get("source", "direct-ats"))
-        if source == "adzuna":
-            source_html = '<a href="https://www.adzuna.com/">Jobs by Adzuna</a>'
-        elif source == "jooble":
-            source_html = "Source: Jooble"
-        else:
-            source_html = "Source: employer career site"
+        role = html.escape(str(job.get("title", "Untitled role")))
+        company = html.escape(str(job.get("company_name", "Unknown company")))
+        experience = html.escape(experience_summary(job))
+        url = html.escape(str(job.get("url", "")), quote=True)
+        text_rows.append(
+            f"{plain_text(str(job.get('title', 'Untitled role')))} | "
+            f"{plain_text(str(job.get('company_name', 'Unknown company')))} | "
+            f"{plain_text(experience_summary(job))} | {str(job.get('url', ''))}"
+        )
         rows.append(
-            "<li><strong>{}</strong> at {}<br>{}<br>{}<br>"
-            "<a href=\"{}\">Apply</a></li>".format(
-                html.escape(str(job.get("title", "Untitled role"))),
-                html.escape(str(job.get("company_name", "Unknown company"))),
-                html.escape(locations),
-                source_html,
-                html.escape(str(job.get("url", "")), quote=True),
+            "<tr>"
+            "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\"><strong>{}</strong></td>"
+            "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\">{}</td>"
+            "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\">{}</td>"
+            "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\"><a href=\"{}\">Apply</a></td>"
+            "</tr>".format(
+                role,
+                company,
+                experience,
+                url,
             )
         )
-    html_body = "<h2>New matching jobs</h2><ul>" + "\n".join(rows) + "</ul>"
+    html_body = (
+        "<div style=\"font-family:Arial,sans-serif;line-height:1.4;max-width:720px;margin:0 auto;\">"
+        "<h2 style=\"margin:0 0 12px 0;\">New matching jobs</h2>"
+        "<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;border-collapse:collapse;table-layout:fixed;\">"
+        "<thead><tr>"
+        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:38%;\">Role</th>"
+        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:26%;\">Company</th>"
+        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:22%;\">Experience</th>"
+        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:14%;\">Apply</th>"
+        "</tr></thead>"
+        "<tbody>"
+        + "".join(rows)
+        + "</tbody></table></div>"
+    )
+    text_body = "\n".join(text_rows)
     resend_key = os.environ.get("JOB_WATCHER_RESEND_API_KEY")
     if resend_key:
         payload = json.dumps({
             "from": "Job Watcher <onboarding@resend.dev>",
             "to": [recipient],
             "subject": subject,
+            "text": text_body,
             "html": html_body,
         }).encode()
         idempotency_key = hashlib.sha256(
@@ -729,7 +766,7 @@ def send_email(jobs: list[dict]) -> None:
         raise RuntimeError("JOB_WATCHER_RESEND_API_KEY is not configured")
     message = EmailMessage()
     message["From"], message["To"], message["Subject"] = sender, recipient, subject
-    message.set_content("\n".join(str(job.get("url", "")) for job in jobs))
+    message.set_content(text_body)
     message.add_alternative(html_body, subtype="html")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as smtp:
         smtp.login(sender, password.replace(" ", ""))
