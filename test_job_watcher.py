@@ -1,5 +1,6 @@
 import sqlite3
 import unittest
+import time
 from unittest.mock import patch
 
 from job_watcher import (
@@ -17,11 +18,12 @@ from job_watcher import (
 
 
 class MatchTests(unittest.TestCase):
-    def job(self, title, active=True, locations=None, description=None):
+    def job(self, title, active=True, locations=None, description=None, posted_at=None):
         return {"title": title, "active": active, "is_visible": True,
                 "locations": locations or ["New York, NY"],
                 "description": description or
-                "This entry-level role offers visa sponsorship and immigration support."}
+                "This entry-level role offers visa sponsorship and immigration support.",
+                "posted_at": posted_at if posted_at is not None else int(time.time()) - 3600}
 
     def test_target_roles(self):
         self.assertTrue(matches(self.job("Software Engineer - New Grad")))
@@ -36,6 +38,33 @@ class MatchTests(unittest.TestCase):
     def test_requires_us_location(self):
         self.assertTrue(matches(self.job("Software Engineer - New Grad", locations=["Remote in USA"])))
         self.assertFalse(matches(self.job("Software Engineer - New Grad", locations=["Toronto, ON, Canada"])))
+        self.assertFalse(matches(self.job("Software Engineer - New Grad", locations=["Remote in Canada"])))
+        self.assertFalse(matches(self.job("Software Engineer - New Grad", locations=["New York, NY", "Toronto, ON, Canada"])))
+
+    @patch("job_watcher.time.time", return_value=100000)
+    def test_requires_recent_posting(self, _time_mock):
+        self.assertTrue(matches(self.job(
+            "Software Engineer - New Grad",
+            description="General responsibilities.",
+            posted_at=100000 - (11 * 60 * 60),
+        )))
+        self.assertFalse(matches(self.job(
+            "Software Engineer - New Grad",
+            description="General responsibilities.",
+            posted_at=100000 - (13 * 60 * 60),
+        )))
+        self.assertFalse(matches(self.job(
+            "Software Engineer - New Grad",
+            description="General responsibilities.",
+            posted_at=100000 - (24 * 60 * 60),
+        )))
+        self.assertFalse(matches({
+            "title": "Software Engineer - New Grad",
+            "active": True,
+            "is_visible": True,
+            "locations": ["New York, NY"],
+            "description": "General responsibilities.",
+        }))
 
     def test_does_not_require_explicit_sponsorship_language(self):
         self.assertTrue(matches(self.job(
@@ -115,6 +144,7 @@ class MatchTests(unittest.TestCase):
                     "name": "Software Engineer - New Grad",
                     "location": {"fullLocation": "Austin, TX", "country": "us"},
                     "company": {"name": "Acme"},
+                    "createdOn": "2026-06-22T10:00:00Z",
                 }],
             },
             {
@@ -123,6 +153,7 @@ class MatchTests(unittest.TestCase):
                 "location": {"fullLocation": "Austin, TX", "country": "us"},
                 "company": {"name": "Acme"},
                 "applyUrl": "https://jobs.smartrecruiters.com/Acme/42",
+                "createdOn": "2026-06-22T10:00:00Z",
                 "jobAd": {"sections": {"qualifications": {
                     "text": "Applicants must be authorized to work in the U.S."
                 }}},
@@ -198,6 +229,7 @@ class MatchTests(unittest.TestCase):
             "location": {"display_name": "Austin, TX"},
             "redirect_url": "https://example.com/a1",
             "description": "Entry-level role with no citizenship requirement.",
+            "created": "2026-06-22T10:00:00Z",
         }]}
         jobs = fetch_adzuna_jobs("app", "key")
         self.assertEqual(jobs[0]["source"], "adzuna")
@@ -212,6 +244,7 @@ class MatchTests(unittest.TestCase):
             "location": "Remote",
             "link": "https://example.com/j1",
             "snippet": "Entry-level role with no citizenship requirement.",
+            "created": "2026-06-22T10:00:00Z",
         }]}
         jobs = fetch_jooble_jobs("key")
         self.assertEqual(jobs[0]["source"], "jooble")

@@ -17,6 +17,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -28,6 +29,7 @@ ATS_BATCH_SIZE = 200
 AGGREGATOR_INTERVAL_SECONDS = 15 * 60
 HEARTBEAT_EXPECTED_SECONDS = 5 * 60
 HEARTBEAT_GRACE_SECONDS = 10 * 60
+MAX_JOB_AGE_SECONDS = 12 * 60 * 60
 SUPPORTED_PROVIDERS = {"ashby", "greenhouse", "lever", "lever-eu", "smartrecruiters"}
 JOB_FAMILY_TERMS = (
     "software engineer",
@@ -134,6 +136,12 @@ US_LOCATION_TERMS = (
     "sf",
     "washington, dc",
 )
+CANADA_LOCATION_TERMS = (
+    "canada",
+    "remote in canada",
+    "remote - canada",
+    "canadian",
+)
 ENTRY_DESCRIPTION_RE = re.compile(
     r"\b(?:new|recent) (?:college )?graduate\b|\bearly career\b|"
     r"\bentry[ -]level\b|\b0\s*(?:-|to)\s*2 years\b|"
@@ -152,10 +160,16 @@ CITIZENSHIP_REQUIREMENT_RE = re.compile(
 
 
 def is_us_location(locations: list[str]) -> bool:
+    lowered_locations = [str(value).lower() for value in locations]
+    if any(
+        any(term == location or term in location for term in CANADA_LOCATION_TERMS)
+        for location in lowered_locations
+    ):
+        return False
     return any(
         US_LOCATION_RE.search(location)
         or any(term == location or term in location for term in US_LOCATION_TERMS)
-        for location in (str(value).lower() for value in locations)
+        for location in lowered_locations
     )
 
 
@@ -167,6 +181,8 @@ def description_mentions_citizenship_requirement(description: str) -> bool:
 
 def potential_match(job: dict) -> bool:
     if not job.get("active") or not job.get("is_visible", True):
+        return False
+    if not job_is_recent(job):
         return False
     title = str(job.get("title", "")).lower()
     if any(term in title for term in EXCLUDED_TERMS):
@@ -357,6 +373,28 @@ def plain_text(value: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", decoded)).strip()
 
 
+def parse_job_datetime(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value / 1000 if value > 10**12 else value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        numeric = int(text)
+        return int(numeric / 1000 if numeric > 10**12 else numeric)
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
 def experience_summary(job: dict) -> str:
     title = str(job.get("title", "")).lower()
     description = str(job.get("description", "")).lower()
@@ -413,6 +451,39 @@ def role_category(job: dict) -> str:
     return "other"
 
 
+def job_posted_timestamp(job: dict) -> int | None:
+    for key in (
+        "posted_at",
+        "published_at",
+        "publishedAt",
+        "updated_at",
+        "updatedAt",
+        "created_at",
+        "createdAt",
+        "date_posted",
+        "datePosted",
+        "released_at",
+        "releasedAt",
+        "created",
+        "releasedDate",
+        "releaseDate",
+        "postedDate",
+    ):
+        timestamp = parse_job_datetime(job.get(key))
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def job_is_recent(job: dict, now: int | None = None) -> bool:
+    current_time = int(time.time()) if now is None else now
+    posted_at = job_posted_timestamp(job)
+    if posted_at is None:
+        return False
+    age = current_time - posted_at
+    return 0 <= age <= MAX_JOB_AGE_SECONDS
+
+
 def company_from_slug(slug: str) -> str:
     return re.sub(r"[-_]+", " ", slug).title()
 
@@ -424,6 +495,7 @@ def direct_job(
     locations: list[str],
     url: str,
     description: str,
+    posted_at: object | None = None,
 ) -> dict:
     board_key = f'{board["provider"]}:{board["slug"]}'
     return {
@@ -435,6 +507,7 @@ def direct_job(
         "locations": [location for location in locations if location],
         "url": url,
         "description": description,
+        "posted_at": posted_at,
         "active": True,
         "is_visible": True,
     }
@@ -473,6 +546,7 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                 [str((item.get("location") or {}).get("name", ""))],
                 str(item.get("absolute_url", "")),
                 plain_text(str(item.get("content", ""))),
+                item.get("updated_at"),
             ))
     elif provider in {"lever", "lever-eu"}:
         domain = "api.eu.lever.co" if provider == "lever-eu" else "api.lever.co"
@@ -494,6 +568,7 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                 [str(location) for location in locations],
                 str(item.get("hostedUrl", "")),
                 description,
+                item.get("createdAt") or item.get("created_at") or item.get("updatedAt"),
             ))
     elif provider == "ashby":
         payload = fetch_json(f"https://api.ashbyhq.com/posting-api/job-board/{slug}")
@@ -521,6 +596,7 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                 [str(item.get("location", "")), *secondary, *countries],
                 url,
                 str(item.get("descriptionPlain", "")),
+                item.get("publishedAt") or item.get("published_at"),
             ))
     elif provider == "smartrecruiters":
         offset = 0
@@ -558,6 +634,12 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                     locations,
                     str(detail.get("applyUrl") or f"https://jobs.smartrecruiters.com/{slug}/{posting_id}"),
                     description,
+                    detail.get("releasedDate")
+                    or detail.get("releaseDate")
+                    or detail.get("createdOn")
+                    or item.get("releasedDate")
+                    or item.get("releaseDate")
+                    or item.get("createdOn"),
                 )
                 job["company_name"] = str(
                     (detail.get("company") or item.get("company") or {}).get("name")
@@ -578,6 +660,7 @@ def aggregator_job(
     location: str,
     url: str,
     description: str,
+    posted_at: object | None = None,
 ) -> dict:
     return {
         "source": source,
@@ -588,6 +671,7 @@ def aggregator_job(
         "locations": [location, "United States"],
         "url": url,
         "description": description,
+        "posted_at": posted_at,
         "active": True,
         "is_visible": True,
     }
@@ -616,6 +700,7 @@ def fetch_adzuna_jobs(app_id: str, app_key: str) -> list[dict]:
             str(location.get("display_name", "United States")),
             str(item.get("redirect_url", "")),
             str(item.get("description", "")),
+            item.get("created"),
         ))
     return jobs
 
@@ -643,6 +728,7 @@ def fetch_jooble_jobs(api_key: str) -> list[dict]:
             str(item.get("location", "United States")),
             str(item.get("link", "")),
             str(item.get("snippet", "")),
+            item.get("updated") or item.get("created") or item.get("date"),
         )
         for item in payload.get("jobs", [])
     ]

@@ -10,7 +10,8 @@ Greenhouse, Lever, Ashby, and SmartRecruiters APIs. Each run checks up to 200 du
 boards. Boards with several relevant roles or a citizenship-safe match run every
 five minutes, boards with some relevant roles run every 30 minutes, and quiet
 boards run every two hours. A board's first successful poll creates a silent
-baseline; only later matching postings are mailed.
+baseline; only later matching postings are mailed. Jobs must have a detectable
+posted timestamp within the last 12 hours to be eligible.
 
 See `SOURCE_POLICY.md` for the source allowlist and rules prohibiting restricted
 scraping, browser automation, cookies, private endpoints, and access-control bypass.
