@@ -14,7 +14,7 @@ quiet boards run every two hours. Failed boards retry after five minutes with
 bounded exponential backoff up to 24 hours, keeping dead boards from consuming
 the active polling budget. A board's first successful poll creates a silent
 baseline; only later matching postings are mailed. Jobs must have a detectable
-posted timestamp within the last 12 hours to be eligible.
+posted timestamp within the last 24 hours to be eligible.
 
 Approved public RSS, Atom, JSON, and JazzHR customer XML feeds can be configured
 in `state/feeds.json`. Feed polling runs no more often than every 15 minutes. A feed must be explicitly
@@ -66,13 +66,13 @@ Never commit or paste those keys into issues, source files, or chat.
 
 The credential-free Jobicy API is enabled by default at a six-hour cadence, as
 requested by its fair-use policy. Its public listings are delayed by six hours
-but remain eligible for the watcher's 12-hour freshness window.
+but remain eligible for the watcher's 24-hour freshness window.
 
 ## Coverage Boundaries
 
 LinkedIn, Jobright, Indeed, and similar authenticated boards are not crawled.
 Their native alerts can be used alongside this watcher, but ingesting them cannot
-reliably enforce the 12-hour and US-only rules unless the provider supplies a
+reliably enforce the 24-hour and US-only rules unless the provider supplies a
 documented API or structured feed. Workday, iCIMS, Taleo, Eightfold, and BambooHR
 are added only when a documented public job-listing interface is
 available and validated; private career-site endpoints are not used.

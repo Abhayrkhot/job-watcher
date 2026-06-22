@@ -54,17 +54,17 @@ class MatchTests(unittest.TestCase):
         self.assertTrue(matches(self.job(
             "Software Engineer - New Grad",
             description="General responsibilities.",
-            posted_at=100000 - (11 * 60 * 60),
+            posted_at=100000 - (23 * 60 * 60),
         )))
         self.assertFalse(matches(self.job(
             "Software Engineer - New Grad",
             description="General responsibilities.",
-            posted_at=100000 - (13 * 60 * 60),
+            posted_at=100000 - (25 * 60 * 60),
         )))
         self.assertFalse(matches(self.job(
             "Software Engineer - New Grad",
             description="General responsibilities.",
-            posted_at=100000 - (24 * 60 * 60),
+            posted_at=100000 - (48 * 60 * 60),
         )))
         self.assertTrue(matches(self.job(
             "Software Engineer - New Grad",

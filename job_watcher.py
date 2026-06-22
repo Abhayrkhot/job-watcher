@@ -37,7 +37,7 @@ FEED_INTERVAL_SECONDS = 15 * 60
 HEALTH_REPORT_INTERVAL_SECONDS = 24 * 60 * 60
 HEARTBEAT_EXPECTED_SECONDS = 5 * 60
 HEARTBEAT_GRACE_SECONDS = 10 * 60
-MAX_JOB_AGE_SECONDS = 12 * 60 * 60
+MAX_JOB_AGE_SECONDS = 24 * 60 * 60
 FUTURE_TIMESTAMP_GRACE_SECONDS = 5 * 60
 SUPPORTED_PROVIDERS = {
     "ashby", "greenhouse", "lever", "lever-eu", "recruitee", "smartrecruiters",
@@ -223,7 +223,7 @@ def rejection_reason(job: dict, now: int | None = None) -> str:
     current_time = int(time.time()) if now is None else now
     age = current_time - posted_at
     if age < -FUTURE_TIMESTAMP_GRACE_SECONDS or age > MAX_JOB_AGE_SECONDS:
-        return "outside_12_hours"
+        return "outside_24_hours"
     title = str(job.get("title", "")).lower()
     if any(term in title for term in EXCLUDED_TERMS):
         return "excluded_seniority_or_internship"
