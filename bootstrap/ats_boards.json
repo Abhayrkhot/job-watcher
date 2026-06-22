@@ -3774,5 +3774,49 @@
   {
     "provider": "smartrecruiters",
     "slug": "WorldwideTechServices"
+  },
+  {
+    "provider": "workable",
+    "slug": "optitrack"
+  },
+  {
+    "provider": "workable",
+    "slug": "avalore"
+  },
+  {
+    "provider": "workable",
+    "slug": "multimediallc"
+  },
+  {
+    "provider": "workable",
+    "slug": "pronexus-1"
+  },
+  {
+    "provider": "workable",
+    "slug": "tiger-analytics"
+  },
+  {
+    "provider": "workable",
+    "slug": "habitat-energy"
+  },
+  {
+    "provider": "workable",
+    "slug": "pony-dot-ai"
+  },
+  {
+    "provider": "workable",
+    "slug": "assist-rx"
+  },
+  {
+    "provider": "workable",
+    "slug": "datavisor-jobs"
+  },
+  {
+    "provider": "workable",
+    "slug": "dispel"
+  },
+  {
+    "provider": "workable",
+    "slug": "quadric-dot-i-o-inc"
   }
 ]

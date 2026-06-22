@@ -16,9 +16,14 @@ be reviewed before adding a source.
 | Lever | Public Postings API GET endpoints | Published jobs only |
 | Ashby | Public Job Postings API | Published jobs only |
 | SmartRecruiters | Public Posting API | Maximum 8 concurrent and 10 requests/second |
+| Recruitee | Public unauthenticated Careers Site API | Published offers only |
+| Workable | Documented public account jobs endpoint | Published jobs; reviewed accounts only |
+| RSS/Atom/JSON feeds | Publisher-provided public feed | Explicit review and allowlist required |
 
 ## Optional Approved Sources
 
+- Jobicy: its documented public API is queried with `geo=usa` every six hours.
+  Job links retain Jobicy attribution, and listings are never republished.
 - Adzuna: API key required. Personal research is permitted; default limit is 250
   calls/day. The connector makes at most 96 calls/day and includes attribution.
 - Jooble: API key approval required. Only the REST API is called at a conservative
@@ -27,6 +32,10 @@ be reviewed before adding a source.
   relevant active board is available for validation.
 - LinkedIn and Jobright: native alerts only. No crawling, browser automation, cookie
   reuse, or private API calls.
+- Workday, iCIMS, Taleo, Eightfold, and BambooHR: do not use undocumented
+  career-site endpoints. Add only a documented public interface or an approved API key.
+- JazzHR: use only an official customer XML feed URL supplied for syndication. Its
+  documentation describes a global JSON feed but does not publish the endpoint.
 
 ## References
 
@@ -36,6 +45,8 @@ be reviewed before adding a source.
 - https://developers.smartrecruiters.com/docs/endpoints
 - https://developers.smartrecruiters.com/docs/rate-limiting
 - https://docs.recruitee.com/reference/intro-to-careers-site-api
+- https://workable.readme.io/reference/jobs-1
+- https://jobicy.com/jobs-rss-feed
 - https://developer.adzuna.com/docs/terms_of_service
 - https://jooble.org/api/about
 - https://jooble.org/info/terms

@@ -9,10 +9,16 @@ from job_watcher import (
     fetch_adzuna_jobs,
     description_mentions_citizenship_requirement,
     fetch_direct_board,
+    fetch_feed_jobs,
+    fetch_jobicy_jobs,
     fetch_jooble_jobs,
+    health_report,
     experience_summary,
+    failure_retry_seconds,
     matches,
     relative_posted_time,
+    rejection_reason,
+    record_metrics,
     role_category,
     select_due_boards,
 )
@@ -59,6 +65,11 @@ class MatchTests(unittest.TestCase):
             description="General responsibilities.",
             posted_at=100000 - (24 * 60 * 60),
         )))
+        self.assertTrue(matches(self.job(
+            "Software Engineer - New Grad",
+            description="General responsibilities.",
+            posted_at=100000 + 60,
+        )))
         self.assertFalse(matches({
             "title": "Software Engineer - New Grad",
             "active": True,
@@ -99,6 +110,22 @@ class MatchTests(unittest.TestCase):
         self.assertFalse(matches(self.job(
             "Software Engineer - New Grad", description=description
         )))
+
+    def test_rejection_reasons_are_specific(self):
+        self.assertEqual(
+            rejection_reason(self.job("Senior Software Engineer")),
+            "excluded_seniority_or_internship",
+        )
+        self.assertEqual(
+            rejection_reason(self.job("Software Engineer", description="Five years required.")),
+            "missing_entry_level_evidence",
+        )
+        self.assertEqual(
+            rejection_reason(self.job(
+                "Software Engineer - New Grad", locations=["Toronto, Canada"]
+            )),
+            "outside_us",
+        )
 
     def test_expanded_role_families(self):
         titles = [
@@ -172,8 +199,83 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(jobs[0]["company_name"], "Acme")
         self.assertTrue(matches(jobs[0]))
 
+    @patch("job_watcher.fetch_json")
+    def test_recruitee_normalization(self, fetch_json):
+        fetch_json.return_value = {"offers": [{
+            "id": 42,
+            "title": "Machine Learning Engineer - New Grad",
+            "location": {"name": "New York, NY"},
+            "careers_url": "https://acme.recruitee.com/o/ml-engineer",
+            "description": "Entry-level machine learning role.",
+            "updated_at": int(time.time()) - 600,
+        }]}
+        _, jobs = fetch_direct_board({"provider": "recruitee", "slug": "acme"})
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["company_name"], "Acme")
+        self.assertTrue(matches(jobs[0]))
+
+    @patch("job_watcher.fetch_json")
+    def test_workable_normalization(self, fetch_json):
+        fetch_json.return_value = {
+            "name": "Acme",
+            "jobs": [{
+                "shortcode": "ABC123",
+                "title": "Software Engineer - New Grad",
+                "url": "https://apply.workable.com/j/ABC123",
+                "published_on": "2026-06-22",
+                "country": "United States",
+                "city": "Austin",
+                "state": "Texas",
+                "telecommuting": True,
+                "experience": "Entry level",
+                "description": "<p>Build production software.</p>",
+                "locations": [{
+                    "city": "Austin", "region": "Texas", "country": "United States"
+                }],
+            }],
+        }
+        _, jobs = fetch_direct_board({"provider": "workable", "slug": "acme"})
+        self.assertEqual(jobs[0]["company_name"], "Acme")
+        self.assertEqual(jobs[0]["posted_display"], "Newly detected")
+        self.assertIn("Remote in USA", jobs[0]["locations"])
+        self.assertTrue(matches(jobs[0]))
+
+    @patch("job_watcher.fetch_text")
+    def test_approved_feed_normalization_does_not_assume_us(self, fetch_text):
+        fetch_text.return_value = '''{"items":[{
+            "id":"1", "title":"Software Engineer - New Grad",
+            "company":"Acme", "location":"Toronto, Canada",
+            "url":"https://example.com/1", "content_text":"Entry-level role.",
+            "date_published":"2026-06-22T10:00:00Z"
+        }]}'''
+        jobs = fetch_feed_jobs({
+            "name": "example", "url": "https://example.com/feed.json",
+            "approved": True, "us_only": False,
+        })
+        self.assertEqual(jobs[0]["locations"], ["Toronto, Canada"])
+        self.assertFalse(matches(jobs[0]))
+
+    @patch("job_watcher.fetch_text")
+    def test_jazzhr_customer_xml_feed_normalization(self, fetch_text):
+        fetch_text.return_value = """<jobs><job>
+            <title>Data Scientist - New Grad</title><company>Acme</company>
+            <city>Boston</city><state>MA</state><country>United States</country>
+            <url>https://acme.applytojob.com/apply/ABC/data-scientist</url>
+            <description>Entry-level data science role.</description>
+            <date>2026-06-22T10:00:00Z</date>
+        </job></jobs>"""
+        jobs = fetch_feed_jobs({
+            "name": "acme-jazzhr",
+            "url": "https://example.com/acme.xml",
+            "approved": True,
+        })
+        self.assertEqual(jobs[0]["company_name"], "Acme")
+        self.assertEqual(jobs[0]["locations"], ["Boston, MA, United States"])
+        self.assertTrue(matches(jobs[0]))
+
     def test_adaptive_board_schedule(self):
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.execute(
             "CREATE TABLE board_stats (board_key TEXT PRIMARY KEY, last_checked INTEGER, "
             "relevant_count INTEGER, match_count INTEGER, failure_count INTEGER)"
@@ -199,6 +301,7 @@ class MatchTests(unittest.TestCase):
 
     def test_board_batch_is_capped_at_200(self):
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.execute(
             "CREATE TABLE board_stats (board_key TEXT PRIMARY KEY, last_checked INTEGER, "
             "relevant_count INTEGER, match_count INTEGER, failure_count INTEGER)"
@@ -209,8 +312,14 @@ class MatchTests(unittest.TestCase):
         ]
         self.assertEqual(len(select_due_boards(connection, boards, now=1000)), 200)
 
+    def test_failed_boards_retry_with_bounded_backoff(self):
+        self.assertEqual(failure_retry_seconds(1), 5 * 60)
+        self.assertEqual(failure_retry_seconds(2), 10 * 60)
+        self.assertEqual(failure_retry_seconds(20), 24 * 60 * 60)
+
     def test_heartbeat_initializes_on_first_run(self):
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.execute(
             "CREATE TABLE heartbeat (id INTEGER PRIMARY KEY CHECK (id = 1), last_run INTEGER NOT NULL)"
         )
@@ -220,6 +329,7 @@ class MatchTests(unittest.TestCase):
 
     def test_heartbeat_reports_missed_runs(self):
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.execute(
             "CREATE TABLE heartbeat (id INTEGER PRIMARY KEY CHECK (id = 1), last_run INTEGER NOT NULL)"
         )
@@ -257,6 +367,39 @@ class MatchTests(unittest.TestCase):
         jobs = fetch_jooble_jobs("key")
         self.assertEqual(jobs[0]["source"], "jooble")
         self.assertTrue(matches(jobs[0]))
+
+    @patch("job_watcher.fetch_json")
+    def test_jobicy_normalization(self, fetch_json):
+        fetch_json.return_value = {"jobs": [{
+            "id": "j2",
+            "jobTitle": "AI Engineer - Entry Level",
+            "companyName": "Acme",
+            "jobGeo": "USA",
+            "url": "https://jobicy.com/jobs/j2",
+            "jobDescription": "Entry-level role.",
+            "pubDate": "2026-06-22T10:00:00Z",
+        }]}
+        jobs = fetch_jobicy_jobs()
+        self.assertEqual(jobs[0]["source"], "jobicy")
+        self.assertTrue(matches(jobs[0]))
+
+    def test_health_report_summarizes_filter_outcomes(self):
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            "CREATE TABLE run_metrics (run_at INTEGER, source TEXT, fetched INTEGER, "
+            "matched INTEGER, new_jobs INTEGER, failures INTEGER, rejections TEXT)"
+        )
+        now = int(time.time())
+        record_metrics(connection, now, "ats:test", [
+            self.job("Software Engineer - New Grad", posted_at=now - 60),
+            self.job("Senior Software Engineer", posted_at=now - 60),
+        ])
+        record_metrics(connection, now, "notifications", [], new_jobs=1)
+        subject, text, _ = health_report(connection, now)
+        self.assertIn("1 alerts", subject)
+        self.assertIn("Jobs inspected: 2", text)
+        self.assertIn("excluded_seniority_or_internship: 1", text)
+        connection.close()
 
 
 if __name__ == "__main__":

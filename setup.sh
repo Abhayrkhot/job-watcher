@@ -18,6 +18,12 @@ umask 077
 printf 'JOB_WATCHER_TO=%q\nJOB_WATCHER_RESEND_API_KEY=%q\n' \
   "$destination" "$resend_key" > .env
 mkdir -p state "$HOME/Library/LaunchAgents"
+if [[ ! -f state/ats_boards.json ]]; then
+  cp bootstrap/ats_boards.json state/ats_boards.json
+fi
+if [[ ! -f state/feeds.json ]]; then
+  cp bootstrap/feeds.json state/feeds.json
+fi
 /usr/bin/python3 job_watcher.py --initialize
 sed -e "s|__PROJECT_DIR__|$SCRIPT_DIR|g" \
   com.personal.job-watcher.plist.template \

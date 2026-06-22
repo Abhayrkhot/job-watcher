@@ -15,6 +15,8 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
 from datetime import datetime, timezone
@@ -25,12 +27,22 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_DIR = BASE_DIR / "state"
 DB_PATH = STATE_DIR / "jobs.sqlite3"
 BOARDS_PATH = STATE_DIR / "ats_boards.json"
+FEEDS_PATH = STATE_DIR / "feeds.json"
+BOOTSTRAP_BOARDS_PATH = BASE_DIR / "bootstrap" / "ats_boards.json"
+BOOTSTRAP_FEEDS_PATH = BASE_DIR / "bootstrap" / "feeds.json"
 ATS_BATCH_SIZE = 200
 AGGREGATOR_INTERVAL_SECONDS = 15 * 60
+AGGREGATOR_INTERVALS = {"jobicy": 6 * 60 * 60}
+FEED_INTERVAL_SECONDS = 15 * 60
+HEALTH_REPORT_INTERVAL_SECONDS = 24 * 60 * 60
 HEARTBEAT_EXPECTED_SECONDS = 5 * 60
 HEARTBEAT_GRACE_SECONDS = 10 * 60
 MAX_JOB_AGE_SECONDS = 12 * 60 * 60
-SUPPORTED_PROVIDERS = {"ashby", "greenhouse", "lever", "lever-eu", "smartrecruiters"}
+FUTURE_TIMESTAMP_GRACE_SECONDS = 5 * 60
+SUPPORTED_PROVIDERS = {
+    "ashby", "greenhouse", "lever", "lever-eu", "recruitee", "smartrecruiters",
+    "workable",
+}
 JOB_FAMILY_TERMS = (
     "software engineer",
     "software developer",
@@ -202,6 +214,34 @@ def matches(job: dict) -> bool:
     )
 
 
+def rejection_reason(job: dict, now: int | None = None) -> str:
+    if not job.get("active") or not job.get("is_visible", True):
+        return "inactive"
+    posted_at = job_posted_timestamp(job)
+    if posted_at is None:
+        return "missing_posted_time"
+    current_time = int(time.time()) if now is None else now
+    age = current_time - posted_at
+    if age < -FUTURE_TIMESTAMP_GRACE_SECONDS or age > MAX_JOB_AGE_SECONDS:
+        return "outside_12_hours"
+    title = str(job.get("title", "")).lower()
+    if any(term in title for term in EXCLUDED_TERMS):
+        return "excluded_seniority_or_internship"
+    if not any(term in title for term in JOB_FAMILY_TERMS):
+        return "outside_role_families"
+    description = str(job.get("description", ""))
+    if not (
+        any(term in title for term in ENTRY_TITLE_TERMS)
+        or ENTRY_DESCRIPTION_RE.search(description)
+    ):
+        return "missing_entry_level_evidence"
+    if not is_us_location(job.get("locations") or []):
+        return "outside_us"
+    if not description_mentions_citizenship_requirement(description):
+        return "citizenship_requirement"
+    return "matched"
+
+
 def stable_id(job: dict) -> str:
     value = str(job.get("id") or job.get("url") or json.dumps(job, sort_keys=True))
     return hashlib.sha256(value.encode()).hexdigest()
@@ -265,6 +305,12 @@ def connect_db() -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS heartbeat "
         "(id INTEGER PRIMARY KEY CHECK (id = 1), last_run INTEGER NOT NULL)"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS run_metrics ("
+        "run_at INTEGER NOT NULL, source TEXT NOT NULL, fetched INTEGER NOT NULL, "
+        "matched INTEGER NOT NULL, new_jobs INTEGER NOT NULL, failures INTEGER NOT NULL, "
+        "rejections TEXT NOT NULL)"
+    )
     return connection
 
 
@@ -299,8 +345,18 @@ def record_jobs(connection: sqlite3.Connection, jobs: list[dict]) -> None:
 
 
 def load_boards() -> list[dict]:
-    boards = json.loads(BOARDS_PATH.read_text()) if BOARDS_PATH.exists() else []
+    path = BOARDS_PATH if BOARDS_PATH.exists() else BOOTSTRAP_BOARDS_PATH
+    boards = json.loads(path.read_text()) if path.exists() else []
     return [board for board in boards if board.get("provider") in SUPPORTED_PROVIDERS]
+
+
+def load_feeds() -> list[dict]:
+    path = FEEDS_PATH if FEEDS_PATH.exists() else BOOTSTRAP_FEEDS_PATH
+    feeds = json.loads(path.read_text()) if path.exists() else []
+    return [
+        feed for feed in feeds
+        if feed.get("name") and feed.get("url") and feed.get("approved") is True
+    ]
 
 
 def board_interval_seconds(relevant_count: int, match_count: int) -> int:
@@ -311,6 +367,10 @@ def board_interval_seconds(relevant_count: int, match_count: int) -> int:
     return 2 * 60 * 60
 
 
+def failure_retry_seconds(failure_count: int) -> int:
+    return min(5 * 60 * (2 ** max(failure_count - 1, 0)), 24 * 60 * 60)
+
+
 def select_due_boards(
     connection: sqlite3.Connection,
     boards: list[dict],
@@ -318,9 +378,15 @@ def select_due_boards(
 ) -> list[dict]:
     current_time = int(time.time()) if now is None else now
     stats = {
-        row[0]: {"last_checked": row[1], "relevant_count": row[2], "match_count": row[3]}
+        row[0]: {
+            "last_checked": row[1],
+            "relevant_count": row[2],
+            "match_count": row[3],
+            "failure_count": row[4],
+        }
         for row in connection.execute(
-            "SELECT board_key, last_checked, relevant_count, match_count FROM board_stats"
+            "SELECT board_key, last_checked, relevant_count, match_count, failure_count "
+            "FROM board_stats"
         )
     }
     due = []
@@ -329,6 +395,10 @@ def select_due_boards(
         board_stats = stats.get(board_key)
         if board_stats is None:
             next_check = 0
+        elif board_stats["failure_count"]:
+            next_check = board_stats["last_checked"] + failure_retry_seconds(
+                board_stats["failure_count"]
+            )
         else:
             next_check = board_stats["last_checked"] + board_interval_seconds(
                 board_stats["relevant_count"], board_stats["match_count"]
@@ -413,6 +483,8 @@ def experience_summary(job: dict) -> str:
 
 
 def relative_posted_time(job: dict, now: int | None = None) -> str:
+    if job.get("posted_display"):
+        return str(job["posted_display"])
     current_time = int(time.time()) if now is None else now
     posted_at = job_posted_timestamp(job)
     if posted_at is None:
@@ -496,7 +568,7 @@ def job_is_recent(job: dict, now: int | None = None) -> bool:
     if posted_at is None:
         return False
     age = current_time - posted_at
-    return 0 <= age <= MAX_JOB_AGE_SECONDS
+    return -FUTURE_TIMESTAMP_GRACE_SECONDS <= age <= MAX_JOB_AGE_SECONDS
 
 
 def company_from_slug(slug: str) -> str:
@@ -664,7 +736,128 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
             offset += len(items)
             if not items or offset >= int(payload.get("totalFound", 0)):
                 break
+    elif provider == "recruitee":
+        payload = fetch_json(f"https://{slug}.recruitee.com/api/offers/")
+        items = payload.get("offers", payload if isinstance(payload, list) else [])
+        for item in items:
+            location = item.get("location") or {}
+            if isinstance(location, dict):
+                location = location.get("name") or location.get("city") or ""
+            locations = [str(location)]
+            locations.extend(
+                str(value.get("name") if isinstance(value, dict) else value)
+                for value in item.get("locations") or []
+            )
+            if item.get("remote"):
+                locations.append("Remote")
+            normalized.append(direct_job(
+                board,
+                item.get("id") or item.get("slug"),
+                str(item.get("title", "")),
+                locations,
+                str(item.get("careers_url") or item.get("url") or ""),
+                plain_text(str(item.get("description") or item.get("description_html") or "")),
+                item.get("published_at") or item.get("updated_at") or item.get("created_at"),
+            ))
+    elif provider == "workable":
+        payload = fetch_json(
+            f"https://www.workable.com/api/accounts/{slug}?details=true"
+        )
+        for item in payload.get("jobs", []):
+            locations = []
+            for location in item.get("locations") or []:
+                if isinstance(location, dict):
+                    locations.append(", ".join(filter(None, [
+                        str(location.get("city", "")),
+                        str(location.get("region", "")),
+                        str(location.get("country", "")),
+                    ])))
+            locations.append(", ".join(filter(None, [
+                str(item.get("city", "")),
+                str(item.get("state", "")),
+                str(item.get("country", "")),
+            ])))
+            if item.get("telecommuting") and str(item.get("country", "")).lower() in {
+                "us", "usa", "united states"
+            }:
+                locations.append("Remote in USA")
+            description = " ".join(filter(None, [
+                str(item.get("experience", "")),
+                str(item.get("education", "")),
+                plain_text(str(item.get("description", ""))),
+            ]))
+            job = direct_job(
+                board,
+                item.get("shortcode") or item.get("id"),
+                str(item.get("title", "")),
+                locations,
+                str(item.get("url") or item.get("shortlink") or ""),
+                description,
+                int(time.time()),
+            )
+            job["company_name"] = str(payload.get("name") or company_from_slug(board["slug"]))
+            job["source_posted_at"] = item.get("published_on") or item.get("created_at")
+            job["posted_display"] = "Newly detected"
+            normalized.append(job)
     return board, normalized
+
+
+def fetch_text(url: str) -> str:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/rss+xml, application/atom+xml, application/json, text/xml",
+            "User-Agent": "personal-new-grad-job-watcher/1.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.read().decode(response.headers.get_content_charset() or "utf-8")
+
+
+def fetch_feed_jobs(feed: dict) -> list[dict]:
+    raw = fetch_text(str(feed["url"]))
+    items = []
+    if raw.lstrip().startswith(("{", "[")):
+        payload = json.loads(raw)
+        items = payload.get("items", payload if isinstance(payload, list) else [])
+    else:
+        root = ET.fromstring(raw)
+        elements = (
+            root.findall(".//item")
+            or root.findall("{*}entry")
+            or root.findall(".//job")
+        )
+        for element in elements:
+            values = {}
+            for child in element:
+                key = child.tag.rsplit("}", 1)[-1]
+                if key == "link" and not (child.text or "").strip():
+                    values[key] = child.attrib.get("href", "")
+                else:
+                    values[key] = child.text or ""
+            items.append(values)
+    jobs = []
+    default_location = "United States" if feed.get("us_only") is True else ""
+    for item in items:
+        url = item.get("url") or item.get("external_url") or item.get("link") or ""
+        content = item.get("content_html") or item.get("content_text") or item.get("description") or item.get("summary") or ""
+        location = item.get("location") or ", ".join(filter(None, [
+            str(item.get("city", "")),
+            str(item.get("state", "")),
+            str(item.get("country", "")),
+        ])) or default_location
+        jobs.append(aggregator_job(
+            f'feed:{feed["name"]}',
+            item.get("id") or item.get("guid") or url,
+            plain_text(str(item.get("title", ""))),
+            str(item.get("company") or feed.get("company") or feed["name"]),
+            str(location),
+            str(url),
+            plain_text(str(content)),
+            item.get("date_published") or item.get("date_modified") or item.get("pubDate") or item.get("published") or item.get("updated") or item.get("date") or item.get("datePosted"),
+            feed.get("us_only") is True,
+        ))
+    return jobs
 
 
 def aggregator_job(
@@ -676,6 +869,7 @@ def aggregator_job(
     url: str,
     description: str,
     posted_at: object | None = None,
+    us_scope: bool = True,
 ) -> dict:
     return {
         "source": source,
@@ -683,7 +877,7 @@ def aggregator_job(
         "id": f"{source}:{job_id}",
         "title": title,
         "company_name": company,
-        "locations": [location, "United States"],
+        "locations": [value for value in [location, "United States" if us_scope else ""] if value],
         "url": url,
         "description": description,
         "posted_at": posted_at,
@@ -749,10 +943,28 @@ def fetch_jooble_jobs(api_key: str) -> list[dict]:
     ]
 
 
+def fetch_jobicy_jobs() -> list[dict]:
+    payload = fetch_json("https://jobicy.com/api/v2/remote-jobs?count=100&geo=usa")
+    return [
+        aggregator_job(
+            "jobicy",
+            item.get("id") or item.get("jobSlug"),
+            str(item.get("jobTitle", "")),
+            str(item.get("companyName", "Unknown company")),
+            str(item.get("jobGeo", "United States / Remote")),
+            str(item.get("url", "")),
+            plain_text(str(item.get("jobDescription") or item.get("jobExcerpt") or "")),
+            item.get("pubDate") or item.get("datePosted"),
+        )
+        for item in payload.get("jobs", [])
+    ]
+
+
 def fetch_due_aggregators(
     connection: sqlite3.Connection, now: int
 ) -> list[tuple[str, list[dict]]]:
     configured = []
+    configured.append(("jobicy", fetch_jobicy_jobs))
     adzuna_id = os.environ.get("JOB_WATCHER_ADZUNA_APP_ID")
     adzuna_key = os.environ.get("JOB_WATCHER_ADZUNA_APP_KEY")
     if adzuna_id and adzuna_key:
@@ -764,7 +976,8 @@ def fetch_due_aggregators(
     last_checks = dict(connection.execute("SELECT source, last_checked FROM source_checks"))
     results = []
     for source, fetcher in configured:
-        if now - int(last_checks.get(source, 0)) < AGGREGATOR_INTERVAL_SECONDS:
+        interval = AGGREGATOR_INTERVALS.get(source, AGGREGATOR_INTERVAL_SECONDS)
+        if now - int(last_checks.get(source, 0)) < interval:
             continue
         try:
             results.append((source, fetcher()))
@@ -777,6 +990,34 @@ def fetch_due_aggregators(
                 (source, now),
             )
     return results
+
+
+def fetch_due_feeds(
+    connection: sqlite3.Connection, feeds: list[dict], now: int
+) -> tuple[list[tuple[str, list[dict]]], list[str]]:
+    last_checks = dict(connection.execute("SELECT source, last_checked FROM source_checks"))
+    results = []
+    failures = []
+    for feed in feeds:
+        source = f'feed:{feed["name"]}'
+        interval = max(
+            int(feed.get("interval_seconds", FEED_INTERVAL_SECONDS)),
+            FEED_INTERVAL_SECONDS,
+        )
+        if now - int(last_checks.get(source, 0)) < interval:
+            continue
+        try:
+            results.append((source, fetch_feed_jobs(feed)))
+        except Exception as exc:
+            failures.append(source)
+            print(f"Feed source failed ({source}): {exc}", file=sys.stderr)
+        finally:
+            connection.execute(
+                "INSERT INTO source_checks(source, last_checked) VALUES (?, ?) "
+                "ON CONFLICT(source) DO UPDATE SET last_checked=excluded.last_checked",
+                (source, now),
+            )
+    return results, failures
 
 
 def heartbeat_message(
@@ -829,13 +1070,62 @@ def fetch_direct_batch(
     return results, failures
 
 
-def send_email(jobs: list[dict]) -> None:
+def deliver_email(subject: str, text_body: str, html_body: str, idempotency_key: str) -> None:
     recipient = os.environ.get("JOB_WATCHER_TO")
     if not recipient:
         raise RuntimeError("JOB_WATCHER_TO is not configured")
+    resend_key = os.environ.get("JOB_WATCHER_RESEND_API_KEY")
+    if resend_key:
+        payload = json.dumps({
+            "from": "Job Watcher <onboarding@resend.dev>",
+            "to": [recipient],
+            "subject": subject,
+            "text": text_body,
+            "html": html_body,
+        }).encode()
+        request = urllib.request.Request(
+            "https://api.resend.com/emails",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {resend_key}",
+                "Content-Type": "application/json",
+                "Idempotency-Key": idempotency_key,
+                "User-Agent": "personal-new-grad-job-watcher/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30):
+            return
+
+    sender = os.environ.get("JOB_WATCHER_GMAIL", recipient)
+    password = os.environ.get("JOB_WATCHER_GMAIL_APP_PASSWORD")
+    if not password:
+        raise RuntimeError("No email provider is configured")
+    message = EmailMessage()
+    message["From"], message["To"], message["Subject"] = sender, recipient, subject
+    message.set_content(text_body)
+    message.add_alternative(html_body, subtype="html")
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as smtp:
+        smtp.login(sender, password.replace(" ", ""))
+        smtp.send_message(message)
+
+
+def send_email(jobs: list[dict]) -> None:
     subject = f"{len(jobs)} new US tech job{'s' if len(jobs) != 1 else ''}"
     rows = []
     text_rows = ["Category | Role | Company | Experience | Posted", "-" * 88]
+    category_order = {name: index for index, name in enumerate(
+        ("ml", "ai", "data_science", "data", "sde", "robotics", "other")
+    )}
+    jobs = sorted(
+        jobs,
+        key=lambda job: (
+            category_order.get(role_category(job), 99),
+            -(job_posted_timestamp(job) or 0),
+            str(job.get("company_name", "")).lower(),
+        ),
+    )
+    previous_category = None
     for job in jobs:
         category = html.escape(role_category(job))
         role = html.escape(str(job.get("title", "Untitled role")))
@@ -849,6 +1139,12 @@ def send_email(jobs: list[dict]) -> None:
             f"{plain_text(str(job.get('company_name', 'Unknown company')))} | "
             f"{plain_text(experience_summary(job))} | {plain_text(relative_posted_time(job))}"
         )
+        if category != previous_category:
+            rows.append(
+                "<tr><td colspan=\"5\" style=\"padding:12px 8px 6px;background:#f3f4f6;"
+                "font-weight:700;text-transform:uppercase;\">{}</td></tr>".format(category)
+            )
+            previous_category = category
         rows.append(
             "<tr>"
             "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\">{}</td>"
@@ -881,43 +1177,90 @@ def send_email(jobs: list[dict]) -> None:
         + "</tbody></table></div>"
     )
     text_body = "\n".join(text_rows)
-    resend_key = os.environ.get("JOB_WATCHER_RESEND_API_KEY")
-    if resend_key:
-        payload = json.dumps({
-            "from": "Job Watcher <onboarding@resend.dev>",
-            "to": [recipient],
-            "subject": subject,
-            "text": text_body,
-            "html": html_body,
-        }).encode()
-        idempotency_key = hashlib.sha256(
-            "|".join(sorted(stable_id(job) for job in jobs)).encode()
-        ).hexdigest()
-        request = urllib.request.Request(
-            "https://api.resend.com/emails",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {resend_key}",
-                "Content-Type": "application/json",
-                "Idempotency-Key": idempotency_key,
-                "User-Agent": "personal-new-grad-job-watcher/1.0",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=30):
-            return
+    idempotency_key = hashlib.sha256(
+        "|".join(sorted(stable_id(job) for job in jobs)).encode()
+    ).hexdigest()
+    deliver_email(subject, text_body, html_body, idempotency_key)
 
-    sender = os.environ.get("JOB_WATCHER_GMAIL", recipient)
-    password = os.environ.get("JOB_WATCHER_GMAIL_APP_PASSWORD")
-    if not password:
-        raise RuntimeError("JOB_WATCHER_RESEND_API_KEY is not configured")
-    message = EmailMessage()
-    message["From"], message["To"], message["Subject"] = sender, recipient, subject
-    message.set_content(text_body)
-    message.add_alternative(html_body, subtype="html")
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context()) as smtp:
-        smtp.login(sender, password.replace(" ", ""))
-        smtp.send_message(message)
+
+def record_metrics(
+    connection: sqlite3.Connection,
+    run_at: int,
+    source: str,
+    jobs: list[dict],
+    new_jobs: int = 0,
+    failures: int = 0,
+) -> None:
+    rejections = Counter(rejection_reason(job, run_at) for job in jobs)
+    connection.execute(
+        "INSERT INTO run_metrics VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            run_at,
+            source,
+            len(jobs),
+            rejections.get("matched", 0),
+            new_jobs,
+            failures,
+            json.dumps(rejections, sort_keys=True),
+        ),
+    )
+
+
+def health_report(connection: sqlite3.Connection, now: int) -> tuple[str, str, str]:
+    since = now - HEALTH_REPORT_INTERVAL_SECONDS
+    rows = connection.execute(
+        "SELECT source, fetched, matched, new_jobs, failures, rejections "
+        "FROM run_metrics WHERE run_at >= ?",
+        (since,),
+    ).fetchall()
+    totals = Counter()
+    rejections = Counter()
+    sources = set()
+    for source, fetched, matched_count, new_count, failures, reasons in rows:
+        if source != "notifications":
+            sources.add(source)
+        totals.update({
+            "fetched": fetched,
+            "matched": matched_count,
+            "new": new_count,
+            "failures": failures,
+        })
+        rejections.update(json.loads(reasons))
+    subject = f"Job Watcher daily health: {totals['new']} alerts"
+    summary = [
+        "Job Watcher ran during the last 24 hours.",
+        f"Sources checked: {len(sources)}",
+        f"Jobs inspected: {totals['fetched']}",
+        f"Jobs matching filters: {totals['matched']}",
+        f"New jobs emailed: {totals['new']}",
+        f"Source failures: {totals['failures']}",
+        "",
+        "Filter outcomes:",
+    ]
+    summary.extend(f"- {key}: {value}" for key, value in rejections.most_common())
+    text_body = "\n".join(summary)
+    html_body = "<div style=\"font-family:Arial,sans-serif\"><h2>Job Watcher health</h2>" + "".join(
+        f"<p style=\"margin:4px 0\">{html.escape(line)}</p>" for line in summary
+    ) + "</div>"
+    return subject, text_body, html_body
+
+
+def send_health_report_if_due(
+    connection: sqlite3.Connection, now: int, force: bool = False
+) -> bool:
+    row = connection.execute(
+        "SELECT last_checked FROM source_checks WHERE source = 'health_report'"
+    ).fetchone()
+    if not force and row and now - int(row[0]) < HEALTH_REPORT_INTERVAL_SECONDS:
+        return False
+    subject, text_body, html_body = health_report(connection, now)
+    deliver_email(subject, text_body, html_body, f"health-{now // HEALTH_REPORT_INTERVAL_SECONDS}")
+    connection.execute(
+        "INSERT INTO source_checks(source, last_checked) VALUES ('health_report', ?) "
+        "ON CONFLICT(source) DO UPDATE SET last_checked=excluded.last_checked",
+        (now,),
+    )
+    return True
 
 
 def source_candidates(
@@ -948,10 +1291,15 @@ def main() -> int:
         print("Test email accepted by the email provider")
         return 0
     boards = load_boards()
+    feeds = load_feeds()
     if not boards:
         raise RuntimeError("No approved ATS boards are configured")
     with connect_db() as connection:
         checked_at = int(time.time())
+        if "--health-report" in sys.argv:
+            send_health_report_if_due(connection, checked_at, force=True)
+            print("Health report accepted by the email provider")
+            return 0
         heartbeat, last_run = heartbeat_message(connection, checked_at)
         print(heartbeat)
         if last_run is not None and checked_at - last_run > HEARTBEAT_GRACE_SECONDS:
@@ -962,10 +1310,16 @@ def main() -> int:
         due_boards = select_due_boards(connection, boards, checked_at)
         direct_results, failed_boards = fetch_direct_batch(due_boards)
         aggregator_results = fetch_due_aggregators(connection, checked_at)
+        feed_results, failed_feeds = fetch_due_feeds(connection, feeds, checked_at)
         candidates = []
         initialized_count = 0
+        metric_jobs: dict[str, list[dict]] = {}
+        metric_failures = Counter(
+            f'ats:{board["provider"]}' for board in failed_boards
+        )
         for board, direct_jobs in direct_results:
             board_key = f'{board["provider"]}:{board["slug"]}'
+            metric_jobs.setdefault(f'ats:{board["provider"]}', []).extend(direct_jobs)
             relevant_count = sum(1 for job in direct_jobs if potential_match(job))
             match_count = sum(1 for job in direct_jobs if matches(job))
             record_board_success(
@@ -979,11 +1333,18 @@ def main() -> int:
         for board in failed_boards:
             record_board_failure(connection, board, checked_at)
         for source, jobs in aggregator_results:
+            metric_jobs.setdefault(f"aggregator:{source}", []).extend(jobs)
             new_candidates, was_initialized = source_candidates(
                 connection, f"aggregator:{source}", jobs
             )
             candidates.extend(new_candidates)
             initialized_count += int(was_initialized)
+        for source, jobs in feed_results:
+            metric_jobs.setdefault(source, []).extend(jobs)
+            new_candidates, was_initialized = source_candidates(connection, source, jobs)
+            candidates.extend(new_candidates)
+            initialized_count += int(was_initialized)
+        metric_failures.update(failed_feeds)
 
         new_jobs = []
         candidate_keys = set()
@@ -995,10 +1356,37 @@ def main() -> int:
         if new_jobs and "--initialize" not in sys.argv:
             send_email(new_jobs)
         record_jobs(connection, new_jobs)
+        for source, jobs in metric_jobs.items():
+            record_metrics(
+                connection,
+                checked_at,
+                source,
+                jobs,
+                failures=metric_failures.pop(source, 0),
+            )
+        for source, failure_count in metric_failures.items():
+            record_metrics(connection, checked_at, source, [], failures=failure_count)
+        record_metrics(
+            connection,
+            checked_at,
+            "notifications",
+            [],
+            new_jobs=len(new_jobs) if "--initialize" not in sys.argv else 0,
+        )
+        connection.execute(
+            "DELETE FROM run_metrics WHERE run_at < ?",
+            (checked_at - 7 * HEALTH_REPORT_INTERVAL_SECONDS,),
+        )
         record_heartbeat(connection, checked_at)
+        if "--initialize" not in sys.argv:
+            try:
+                send_health_report_if_due(connection, checked_at)
+            except Exception as exc:
+                print(f"Health report failed: {exc}", file=sys.stderr)
     print(
         f"Selected {len(due_boards)} ATS boards; checked {len(direct_results)}; "
         f"failed {len(failed_boards)}; aggregators {len(aggregator_results)}; "
+        f"feeds {len(feed_results)} (failed {len(failed_feeds)}); "
         f"initialized {initialized_count}; recorded {len(new_jobs)} new matching jobs"
     )
     return 0
