@@ -12,6 +12,7 @@ from job_watcher import (
     fetch_jooble_jobs,
     experience_summary,
     matches,
+    relative_posted_time,
     role_category,
     select_due_boards,
 )
@@ -133,6 +134,13 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(role_category(self.job("Data Scientist")), "data_science")
         self.assertEqual(role_category(self.job("Data Engineer")), "data")
         self.assertEqual(role_category(self.job("Robotics Software Engineer")), "robotics")
+
+    @patch("job_watcher.time.time", return_value=100000)
+    def test_relative_posted_time(self, _time_mock):
+        self.assertEqual(relative_posted_time({"posted_at": 100000 - 30}), "Just now")
+        self.assertEqual(relative_posted_time({"posted_at": 100000 - (15 * 60)}), "15m ago")
+        self.assertEqual(relative_posted_time({"posted_at": 100000 - (3 * 60 * 60)}), "3h ago")
+        self.assertEqual(relative_posted_time({}), "Unknown")
 
     @patch("job_watcher.fetch_json")
     def test_smartrecruiters_normalization(self, fetch_json):

@@ -412,6 +412,21 @@ def experience_summary(job: dict) -> str:
     return "Entry level"
 
 
+def relative_posted_time(job: dict, now: int | None = None) -> str:
+    current_time = int(time.time()) if now is None else now
+    posted_at = job_posted_timestamp(job)
+    if posted_at is None:
+        return "Unknown"
+    age = max(current_time - posted_at, 0)
+    if age < 60:
+        return "Just now"
+    minutes = age // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    return f"{hours}h ago"
+
+
 def role_category(job: dict) -> str:
     title = str(job.get("title", "")).lower()
     description = str(job.get("description", "")).lower()
@@ -820,32 +835,34 @@ def send_email(jobs: list[dict]) -> None:
         raise RuntimeError("JOB_WATCHER_TO is not configured")
     subject = f"{len(jobs)} new US tech job{'s' if len(jobs) != 1 else ''}"
     rows = []
-    text_rows = ["Category | Role | Company | Experience | Apply", "-" * 92]
+    text_rows = ["Category | Role | Company | Experience | Posted", "-" * 88]
     for job in jobs:
         category = html.escape(role_category(job))
         role = html.escape(str(job.get("title", "Untitled role")))
         company = html.escape(str(job.get("company_name", "Unknown company")))
         experience = html.escape(experience_summary(job))
+        posted = html.escape(relative_posted_time(job))
         url = html.escape(str(job.get("url", "")), quote=True)
         text_rows.append(
             f"{role_category(job)} | "
             f"{plain_text(str(job.get('title', 'Untitled role')))} | "
             f"{plain_text(str(job.get('company_name', 'Unknown company')))} | "
-            f"{plain_text(experience_summary(job))} | {str(job.get('url', ''))}"
+            f"{plain_text(experience_summary(job))} | {plain_text(relative_posted_time(job))}"
         )
         rows.append(
             "<tr>"
             "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\">{}</td>"
-            "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\"><strong>{}</strong></td>"
+            "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\"><strong><a href=\"{}\">{}</a></strong></td>"
             "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\">{}</td>"
             "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\">{}</td>"
-            "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\"><a href=\"{}\">Apply</a></td>"
+            "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\">{}</td>"
             "</tr>".format(
                 category,
+                url,
                 role,
                 company,
                 experience,
-                url,
+                posted,
             )
         )
     html_body = (
@@ -857,7 +874,7 @@ def send_email(jobs: list[dict]) -> None:
         "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:34%;\">Role</th>"
         "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:22%;\">Company</th>"
         "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:18%;\">Experience</th>"
-        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:14%;\">Apply</th>"
+        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:14%;\">Posted</th>"
         "</tr></thead>"
         "<tbody>"
         + "".join(rows)
