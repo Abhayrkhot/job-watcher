@@ -5,6 +5,12 @@ on:
     # Offset from the top of the hour, when scheduled Actions traffic is highest.
     - cron: "2/5 * * * *"
   workflow_dispatch:
+    inputs:
+      test_email:
+        description: Send a delivery test instead of polling jobs
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -44,7 +50,13 @@ jobs:
         env:
           JOB_WATCHER_TO: ${{ secrets.JOB_WATCHER_TO }}
           JOB_WATCHER_RESEND_API_KEY: ${{ secrets.JOB_WATCHER_RESEND_API_KEY }}
-        run: python3 job_watcher.py
+        shell: bash
+        run: |
+          if [[ "${{ inputs.test_email }}" == "true" ]]; then
+            python3 job_watcher.py --test-email
+          else
+            python3 job_watcher.py
+          fi
 
       - name: Persist state
         shell: bash
