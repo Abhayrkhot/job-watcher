@@ -12,6 +12,7 @@ import smtplib
 import sqlite3
 import ssl
 import sys
+import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -487,7 +488,7 @@ def send_email(jobs: list[dict]) -> None:
 def main() -> int:
     if "--test-email" in sys.argv:
         send_email([{
-            "id": "delivery-test",
+            "id": f"delivery-test-{time.time_ns()}",
             "title": "Job Watcher Delivery Test",
             "company_name": "Job Watcher",
             "locations": ["United States / Remote"],
