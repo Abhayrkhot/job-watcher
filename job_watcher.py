@@ -374,6 +374,45 @@ def experience_summary(job: dict) -> str:
     return "Entry level"
 
 
+def role_category(job: dict) -> str:
+    title = str(job.get("title", "")).lower()
+    description = str(job.get("description", "")).lower()
+    text = f"{title} {description}"
+    categories = [
+        ("robotics", (
+            "robotics", "perception engineer", "autonomy", "control systems",
+        )),
+        ("ml", (
+            "machine learning engineer", "ml engineer", "mlops", "ml ops",
+            "ml platform", "ml infrastructure", "ml research",
+        )),
+        ("ai", (
+            "ai engineer", "artificial intelligence", "genai", "gen ai",
+            "llm", "inference engineer", "nlp engineer", "prompt", "rag",
+        )),
+        ("data_science", (
+            "data scientist", "decision scientist", "applied scientist",
+            "research scientist", "scientist", "experiment", "ab test",
+        )),
+        ("data", (
+            "data engineer", "analytics engineer", "data analyst",
+            "business intelligence", "bi engineer", "analytics",
+        )),
+        ("sde", (
+            "software engineer", "software developer", "backend engineer",
+            "back-end engineer", "frontend engineer", "front-end engineer",
+            "full stack engineer", "full-stack engineer", "platform engineer",
+            "infra engineer", "infrastructure engineer", "devops engineer",
+            "site reliability engineer", "distributed systems engineer",
+            "security engineer", "qa automation engineer", "sdet",
+        )),
+    ]
+    for label, terms in categories:
+        if any(term in text for term in terms):
+            return label
+    return "other"
+
+
 def company_from_slug(slug: str) -> str:
     return re.sub(r"[-_]+", " ", slug).title()
 
@@ -695,24 +734,28 @@ def send_email(jobs: list[dict]) -> None:
         raise RuntimeError("JOB_WATCHER_TO is not configured")
     subject = f"{len(jobs)} new US tech job{'s' if len(jobs) != 1 else ''}"
     rows = []
-    text_rows = ["Role | Company | Experience | Apply", "-" * 72]
+    text_rows = ["Category | Role | Company | Experience | Apply", "-" * 92]
     for job in jobs:
+        category = html.escape(role_category(job))
         role = html.escape(str(job.get("title", "Untitled role")))
         company = html.escape(str(job.get("company_name", "Unknown company")))
         experience = html.escape(experience_summary(job))
         url = html.escape(str(job.get("url", "")), quote=True)
         text_rows.append(
+            f"{role_category(job)} | "
             f"{plain_text(str(job.get('title', 'Untitled role')))} | "
             f"{plain_text(str(job.get('company_name', 'Unknown company')))} | "
             f"{plain_text(experience_summary(job))} | {str(job.get('url', ''))}"
         )
         rows.append(
             "<tr>"
+            "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\">{}</td>"
             "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\"><strong>{}</strong></td>"
             "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\">{}</td>"
             "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\">{}</td>"
             "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\"><a href=\"{}\">Apply</a></td>"
             "</tr>".format(
+                category,
                 role,
                 company,
                 experience,
@@ -724,9 +767,10 @@ def send_email(jobs: list[dict]) -> None:
         "<h2 style=\"margin:0 0 12px 0;\">New matching jobs</h2>"
         "<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;border-collapse:collapse;table-layout:fixed;\">"
         "<thead><tr>"
-        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:38%;\">Role</th>"
-        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:26%;\">Company</th>"
-        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:22%;\">Experience</th>"
+        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:12%;\">Cat</th>"
+        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:34%;\">Role</th>"
+        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:22%;\">Company</th>"
+        "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:18%;\">Experience</th>"
         "<th align=\"left\" style=\"padding:8px;border-bottom:2px solid #111827;width:14%;\">Apply</th>"
         "</tr></thead>"
         "<tbody>"

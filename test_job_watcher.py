@@ -11,6 +11,7 @@ from job_watcher import (
     fetch_jooble_jobs,
     experience_summary,
     matches,
+    role_category,
     select_due_boards,
 )
 
@@ -95,6 +96,14 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(experience_summary(self.job(
             "Software Engineer", description="General responsibilities."
         )), "Entry level")
+
+    def test_role_category(self):
+        self.assertEqual(role_category(self.job("Machine Learning Engineer")), "ml")
+        self.assertEqual(role_category(self.job("Software Engineer")), "sde")
+        self.assertEqual(role_category(self.job("AI Engineer")), "ai")
+        self.assertEqual(role_category(self.job("Data Scientist")), "data_science")
+        self.assertEqual(role_category(self.job("Data Engineer")), "data")
+        self.assertEqual(role_category(self.job("Robotics Software Engineer")), "robotics")
 
     @patch("job_watcher.fetch_json")
     def test_smartrecruiters_normalization(self, fetch_json):
