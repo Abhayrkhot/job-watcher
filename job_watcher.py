@@ -311,6 +311,12 @@ def connect_db() -> sqlite3.Connection:
         "matched INTEGER NOT NULL, new_jobs INTEGER NOT NULL, failures INTEGER NOT NULL, "
         "rejections TEXT NOT NULL)"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS observed_source_jobs ("
+        "source TEXT NOT NULL, job_id TEXT NOT NULL, "
+        "first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+        "PRIMARY KEY(source, job_id))"
+    )
     return connection
 
 
@@ -793,11 +799,9 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                 locations,
                 str(item.get("url") or item.get("shortlink") or ""),
                 description,
-                int(time.time()),
+                item.get("published_on") or item.get("created_at"),
             )
             job["company_name"] = str(payload.get("name") or company_from_slug(board["slug"]))
-            job["source_posted_at"] = item.get("published_on") or item.get("created_at")
-            job["posted_display"] = "Newly detected"
             normalized.append(job)
     return board, normalized
 
@@ -1266,6 +1270,33 @@ def send_health_report_if_due(
 def source_candidates(
     connection: sqlite3.Connection, source_key: str, jobs: list[dict]
 ) -> tuple[list[dict], bool]:
+    if source_key.startswith("workable:"):
+        observed = {
+            row[0] for row in connection.execute(
+                "SELECT job_id FROM observed_source_jobs WHERE source = ?",
+                (source_key,),
+            )
+        }
+        job_ids = {stable_id(job) for job in jobs}
+        if not observed:
+            connection.executemany(
+                "INSERT OR IGNORE INTO observed_source_jobs(source, job_id) VALUES (?, ?)",
+                [(source_key, job_id) for job_id in job_ids],
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO initialized_boards(board_key) VALUES (?)",
+                (source_key,),
+            )
+            return [], True
+        detected_at = int(time.time())
+        for job in jobs:
+            if stable_id(job) not in observed:
+                job["posted_at"] = detected_at
+                job["posted_display"] = "Newly detected"
+        connection.executemany(
+            "INSERT OR IGNORE INTO observed_source_jobs(source, job_id) VALUES (?, ?)",
+            [(source_key, job_id) for job_id in job_ids],
+        )
     matching = [job for job in jobs if matches(job)]
     initialized = connection.execute(
         "SELECT 1 FROM initialized_boards WHERE board_key = ?", (source_key,)

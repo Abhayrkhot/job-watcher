@@ -21,6 +21,7 @@ from job_watcher import (
     record_metrics,
     role_category,
     select_due_boards,
+    source_candidates,
 )
 
 
@@ -236,9 +237,48 @@ class MatchTests(unittest.TestCase):
         }
         _, jobs = fetch_direct_board({"provider": "workable", "slug": "acme"})
         self.assertEqual(jobs[0]["company_name"], "Acme")
-        self.assertEqual(jobs[0]["posted_display"], "Newly detected")
+        self.assertEqual(jobs[0]["posted_at"], "2026-06-22")
         self.assertIn("Remote in USA", jobs[0]["locations"])
-        self.assertTrue(matches(jobs[0]))
+
+    def test_workable_only_treats_post_baseline_ids_as_new(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE observed_source_jobs (source TEXT, job_id TEXT, "
+            "first_seen TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(source, job_id))"
+        )
+        connection.execute(
+            "CREATE TABLE initialized_boards (board_key TEXT PRIMARY KEY, "
+            "initialized_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        connection.execute(
+            "CREATE TABLE seen_jobs (id TEXT PRIMARY KEY, first_seen TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        connection.execute(
+            "CREATE TABLE seen_urls (url TEXT PRIMARY KEY, first_seen TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        connection.execute(
+            "CREATE TABLE seen_fingerprints (fingerprint TEXT PRIMARY KEY, "
+            "first_seen TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        old_job = self.job("Software Engineer - New Grad", posted_at=1)
+        old_job.update({
+            "id": "workable:acme:old", "board_key": "workable:acme",
+            "company_name": "Acme", "url": "https://apply.workable.com/j/old",
+        })
+        candidates, initialized = source_candidates(
+            connection, "workable:acme", [old_job]
+        )
+        self.assertTrue(initialized)
+        self.assertEqual(candidates, [])
+
+        new_job = dict(old_job, id="workable:acme:new", url="https://apply.workable.com/j/new")
+        candidates, initialized = source_candidates(
+            connection, "workable:acme", [old_job, new_job]
+        )
+        self.assertFalse(initialized)
+        self.assertEqual([job["id"] for job in candidates], ["workable:acme:new"])
+        self.assertEqual(candidates[0]["posted_display"], "Newly detected")
 
     @patch("job_watcher.fetch_text")
     def test_approved_feed_normalization_does_not_assume_us(self, fetch_text):
