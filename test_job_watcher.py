@@ -6,7 +6,7 @@ from job_watcher import (
     canonical_url,
     heartbeat_message,
     fetch_adzuna_jobs,
-    description_offers_sponsorship,
+    description_mentions_citizenship_requirement,
     fetch_direct_board,
     fetch_jooble_jobs,
     matches,
@@ -35,19 +35,19 @@ class MatchTests(unittest.TestCase):
         self.assertTrue(matches(self.job("Software Engineer - New Grad", locations=["Remote in USA"])))
         self.assertFalse(matches(self.job("Software Engineer - New Grad", locations=["Toronto, ON, Canada"])))
 
-    def test_requires_explicit_sponsorship(self):
-        self.assertFalse(matches(self.job(
+    def test_does_not_require_explicit_sponsorship_language(self):
+        self.assertTrue(matches(self.job(
             "Software Engineer - New Grad", description="No sponsorship information provided."
         )))
-        self.assertFalse(matches(self.job(
-            "Software Engineer - New Grad", description="We do not offer visa sponsorship."
+        self.assertTrue(matches(self.job(
+            "Software Engineer - New Grad", description="Standard benefits and growth."
         )))
 
     def test_direct_ats_role(self):
         job = self.job("Machine Learning Engineer - New Grad")
         job.update({
             "source": "direct-ats",
-            "description": "We offer visa sponsorship and immigration support for this role.",
+            "description": "Standard benefits and career growth.",
         })
         self.assertTrue(matches(job))
 
@@ -55,16 +55,18 @@ class MatchTests(unittest.TestCase):
         job = self.job("Machine Learning Engineer")
         job.update({
             "source": "direct-ats",
-            "description": "Visa sponsorship is available. Five years of experience required.",
+            "description": "Five years of experience required.",
         })
         self.assertFalse(matches(job))
 
-    def test_negative_sponsorship_language_wins(self):
+    def test_citizenship_requirement_wins(self):
         description = (
-            "We support employees with immigration questions, but visa sponsorship "
-            "is not available for this position."
+            "Applicants must be US citizens and able to obtain a security clearance."
         )
-        self.assertFalse(description_offers_sponsorship(description))
+        self.assertFalse(description_mentions_citizenship_requirement(description))
+        self.assertFalse(matches(self.job(
+            "Software Engineer - New Grad", description=description
+        )))
 
     def test_expanded_role_families(self):
         titles = [
@@ -103,7 +105,7 @@ class MatchTests(unittest.TestCase):
                 "company": {"name": "Acme"},
                 "applyUrl": "https://jobs.smartrecruiters.com/Acme/42",
                 "jobAd": {"sections": {"qualifications": {
-                    "text": "Visa sponsorship is available for this role."
+                    "text": "Applicants must be authorized to work in the U.S."
                 }}},
             },
         ]
@@ -176,7 +178,7 @@ class MatchTests(unittest.TestCase):
             "company": {"display_name": "Acme"},
             "location": {"display_name": "Austin, TX"},
             "redirect_url": "https://example.com/a1",
-            "description": "Entry-level role with visa sponsorship available.",
+            "description": "Entry-level role with no citizenship requirement.",
         }]}
         jobs = fetch_adzuna_jobs("app", "key")
         self.assertEqual(jobs[0]["source"], "adzuna")
@@ -190,7 +192,7 @@ class MatchTests(unittest.TestCase):
             "company": "Acme",
             "location": "Remote",
             "link": "https://example.com/j1",
-            "snippet": "Entry-level role offering H-1B visa sponsorship.",
+            "snippet": "Entry-level role with no citizenship requirement.",
         }]}
         jobs = fetch_jooble_jobs("key")
         self.assertEqual(jobs[0]["source"], "jooble")

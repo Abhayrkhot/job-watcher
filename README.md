@@ -1,17 +1,16 @@
 # New-Grad Job Watcher
 
 Checks approved employer ATS boards every five minutes and emails new US and
-US-remote entry-level technical roles that explicitly offer sponsorship. SQLite
-state prevents duplicate mail and records a heartbeat so missed runs are visible
-in the logs.
+US-remote entry-level technical roles that do not include an explicit citizenship
+requirement. SQLite state prevents duplicate mail and records a heartbeat so
+missed runs are visible in the logs.
 
 The watcher polls a reviewed registry of employer career boards through public
 Greenhouse, Lever, Ashby, and SmartRecruiters APIs. Each run checks up to 200 due
-boards. Boards with several relevant roles or a sponsorship match run every five
-minutes, boards with some relevant roles run every 30 minutes, and quiet boards run
-every two hours. A board's first successful poll creates a silent baseline; only
-later matching postings are mailed. Roles must contain explicit positive
-visa-sponsorship language.
+boards. Boards with several relevant roles or a citizenship-safe match run every
+five minutes, boards with some relevant roles run every 30 minutes, and quiet
+boards run every two hours. A board's first successful poll creates a silent
+baseline; only later matching postings are mailed.
 
 See `SOURCE_POLICY.md` for the source allowlist and rules prohibiting restricted
 scraping, browser automation, cookies, private endpoints, and access-control bypass.

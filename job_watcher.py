@@ -141,16 +141,12 @@ ENTRY_DESCRIPTION_RE = re.compile(
     r"\bno (?:prior |professional )?experience (?:is )?required\b",
     re.I,
 )
-SPONSORSHIP_NEGATIVE_RE = re.compile(
-    r"\b(?:do(?:es)? not|not|no|unable to|cannot|can't|won't|without)\b"
-    r".{0,55}\b(?:sponsor|sponsorship)\b|"
-    r"\b(?:sponsor|sponsorship)\b.{0,55}\b(?:not available|unavailable|unable)\b|"
-    r"\bauthori[sz]ed to work\b.{0,80}\bwithout\b.{0,30}\bsponsorship\b",
-    re.I | re.S,
-)
-SPONSORSHIP_POSITIVE_RE = re.compile(
-    r"\b(?:visa|immigration|h-?1b)\b.{0,70}\b(?:sponsor|sponsorship|support|available)\b|"
-    r"\b(?:sponsor|sponsorship|support)\b.{0,70}\b(?:visa|immigration|h-?1b)\b",
+CITIZENSHIP_REQUIREMENT_RE = re.compile(
+    r"\b(?:us\s+citizen(?:s|ship)?|u\.s\.\s+citizen(?:s|ship)?|"
+    r"citizenship\s+required|citizenship\s+is\s+required|"
+    r"must\s+be\s+(?:a\s+|an\s+)?citizen(?:s|ship)?|"
+    r"only\s+(?:us\s+)?citizens?|"
+    r"must\s+be\s+(?:a\s+|an\s+)?us\s+citizen(?:s|ship)?)\b",
     re.I | re.S,
 )
 
@@ -163,10 +159,10 @@ def is_us_location(locations: list[str]) -> bool:
     )
 
 
-def description_offers_sponsorship(description: str) -> bool:
-    if SPONSORSHIP_NEGATIVE_RE.search(description):
+def description_mentions_citizenship_requirement(description: str) -> bool:
+    if CITIZENSHIP_REQUIREMENT_RE.search(description):
         return False
-    return bool(SPONSORSHIP_POSITIVE_RE.search(description))
+    return True
 
 
 def potential_match(job: dict) -> bool:
@@ -185,7 +181,7 @@ def potential_match(job: dict) -> bool:
 
 
 def matches(job: dict) -> bool:
-    return potential_match(job) and description_offers_sponsorship(
+    return potential_match(job) and description_mentions_citizenship_requirement(
         str(job.get("description", ""))
     )
 
@@ -546,7 +542,7 @@ def fetch_adzuna_jobs(app_id: str, app_key: str) -> list[dict]:
         "app_id": app_id,
         "app_key": app_key,
         "results_per_page": 50,
-        "what": "visa sponsorship",
+        "what": "software engineer OR data engineer OR machine learning engineer OR AI engineer OR data scientist OR new grad OR entry level",
         "where": "United States",
         "sort_by": "date",
         "content-type": "application/json",
@@ -571,8 +567,8 @@ def fetch_adzuna_jobs(app_id: str, app_key: str) -> list[dict]:
 def fetch_jooble_jobs(api_key: str) -> list[dict]:
     body = json.dumps({
         "keywords": (
-            "visa sponsorship software engineer, data engineer, machine learning engineer, "
-            "AI engineer, data scientist"
+            "software engineer, data engineer, machine learning engineer, "
+            "AI engineer, data scientist, new grad, entry level"
         ),
         "location": "United States",
         "page": "1",
@@ -680,7 +676,7 @@ def send_email(jobs: list[dict]) -> None:
     recipient = os.environ.get("JOB_WATCHER_TO")
     if not recipient:
         raise RuntimeError("JOB_WATCHER_TO is not configured")
-    subject = f"{len(jobs)} new US tech job{'s' if len(jobs) != 1 else ''} offering sponsorship"
+    subject = f"{len(jobs)} new US tech job{'s' if len(jobs) != 1 else ''}"
     rows = []
     for job in jobs:
         locations = ", ".join(job.get("locations") or ["Location not listed"])
