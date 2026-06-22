@@ -22,29 +22,19 @@ scraping, browser automation, cookies, private endpoints, and access-control byp
 2. Create an API key at <https://resend.com/api-keys>.
 3. Run `bash setup.sh` and enter the destination and key locally.
 
-The first run records existing jobs without emailing them. Later runs send only new
-matches. Logs are under `state/`.
+The installer writes a local LaunchAgent plist to `~/Library/LaunchAgents` and
+starts it immediately. The first run records existing jobs without emailing them.
+Later runs send only new matches. Logs are under `state/`.
 
-## GitHub Actions
+## Local Scheduling
 
-The workflow in `.github/workflows/job-watcher.yml` runs every five minutes. It
-stores the current SQLite database and board cursor as a single squashed commit on
-the `job-watcher-state` branch, keeping secrets out of persisted state.
+`setup.sh` installs a LaunchAgent that runs every five minutes. That is now the
+source of truth for polling, so the watcher does not depend on GitHub Actions.
 
-Use a public repository so standard GitHub-hosted runner usage remains free. Add
-these repository Actions secrets:
-
-- `JOB_WATCHER_TO`: destination email address
-- `JOB_WATCHER_RESEND_API_KEY`: Resend API key
-
-Optional approved aggregator secrets:
+Optional approved aggregator secrets can still be added locally through `.env`:
 
 - `JOB_WATCHER_ADZUNA_APP_ID` and `JOB_WATCHER_ADZUNA_APP_KEY`
 - `JOB_WATCHER_JOOBLE_API_KEY`
 
 Register through <https://developer.adzuna.com/> and <https://jooble.org/api/about>.
-The watcher checks configured aggregators every 15 minutes. Never commit or paste
-their keys into issues, source files, or chat.
-
-Scheduled Actions can be delayed or dropped during GitHub load. The workflow is a
-free best-effort scheduler, not a guaranteed five-minute service.
+Never commit or paste those keys into issues, source files, or chat.
