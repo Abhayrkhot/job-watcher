@@ -1,0 +1,61 @@
+name: Job watcher
+
+on:
+  schedule:
+    # Offset from the top of the hour, when scheduled Actions traffic is highest.
+    - cron: "2/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: job-watcher-state
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore persistent state
+        shell: bash
+        run: |
+          mkdir -p state
+          if git fetch origin job-watcher-state && \
+             git show FETCH_HEAD:state.tar.gz > /tmp/job-watcher-state.tar.gz; then
+            tar -xzf /tmp/job-watcher-state.tar.gz -C state
+          else
+            cp bootstrap/ats_boards.json state/ats_boards.json
+          fi
+
+      - name: Validate required secrets
+        env:
+          JOB_WATCHER_TO: ${{ secrets.JOB_WATCHER_TO }}
+          JOB_WATCHER_RESEND_API_KEY: ${{ secrets.JOB_WATCHER_RESEND_API_KEY }}
+        shell: bash
+        run: |
+          test -n "$JOB_WATCHER_TO"
+          test -n "$JOB_WATCHER_RESEND_API_KEY"
+
+      - name: Poll approved job APIs
+        env:
+          JOB_WATCHER_TO: ${{ secrets.JOB_WATCHER_TO }}
+          JOB_WATCHER_RESEND_API_KEY: ${{ secrets.JOB_WATCHER_RESEND_API_KEY }}
+        run: python3 job_watcher.py
+
+      - name: Persist state
+        shell: bash
+        run: |
+          tar -czf /tmp/state.tar.gz -C state \
+            ats_boards.json ats_cursor.txt jobs.sqlite3
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git checkout --orphan job-watcher-state-next
+          git rm -rf .
+          cp /tmp/state.tar.gz state.tar.gz
+          git add -f state.tar.gz
+          git commit -m "Update watcher state"
+          git push --force origin HEAD:job-watcher-state
