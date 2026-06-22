@@ -24,8 +24,8 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_DIR = BASE_DIR / "state"
 DB_PATH = STATE_DIR / "jobs.sqlite3"
 BOARDS_PATH = STATE_DIR / "ats_boards.json"
-CURSOR_PATH = STATE_DIR / "ats_cursor.txt"
-ATS_BATCH_SIZE = 100
+ATS_BATCH_SIZE = 200
+AGGREGATOR_INTERVAL_SECONDS = 15 * 60
 SUPPORTED_PROVIDERS = {"ashby", "greenhouse", "lever", "lever-eu", "smartrecruiters"}
 JOB_FAMILY_TERMS = (
     "software engineer",
@@ -167,7 +167,7 @@ def description_offers_sponsorship(description: str) -> bool:
     return bool(SPONSORSHIP_POSITIVE_RE.search(description))
 
 
-def matches(job: dict) -> bool:
+def potential_match(job: dict) -> bool:
     if not job.get("active") or not job.get("is_visible", True):
         return False
     title = str(job.get("title", "")).lower()
@@ -179,11 +179,12 @@ def matches(job: dict) -> bool:
     entry_match = any(term in title for term in ENTRY_TITLE_TERMS) or bool(
         ENTRY_DESCRIPTION_RE.search(description)
     )
-    return (
-        role_match
-        and entry_match
-        and is_us_location(locations)
-        and description_offers_sponsorship(description)
+    return role_match and entry_match and is_us_location(locations)
+
+
+def matches(job: dict) -> bool:
+    return potential_match(job) and description_offers_sponsorship(
+        str(job.get("description", ""))
     )
 
 
@@ -207,6 +208,16 @@ def canonical_url(job: dict) -> str:
     )
 
 
+def job_fingerprint(job: dict) -> str:
+    fields = [
+        str(job.get("company_name", "")),
+        str(job.get("title", "")),
+        *sorted(str(location) for location in job.get("locations") or []),
+    ]
+    normalized = "|".join(re.sub(r"[^a-z0-9]+", " ", field.lower()).strip() for field in fields)
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
 def connect_db() -> sqlite3.Connection:
     STATE_DIR.mkdir(exist_ok=True)
     connection = sqlite3.connect(DB_PATH)
@@ -222,12 +233,30 @@ def connect_db() -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS initialized_boards "
         "(board_key TEXT PRIMARY KEY, initialized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS seen_fingerprints "
+        "(fingerprint TEXT PRIMARY KEY, first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS board_stats ("
+        "board_key TEXT PRIMARY KEY, last_checked INTEGER NOT NULL, "
+        "relevant_count INTEGER NOT NULL DEFAULT 0, match_count INTEGER NOT NULL DEFAULT 0, "
+        "failure_count INTEGER NOT NULL DEFAULT 0)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS source_checks "
+        "(source TEXT PRIMARY KEY, last_checked INTEGER NOT NULL)"
+    )
     return connection
 
 
 def job_seen(connection: sqlite3.Connection, job: dict) -> bool:
     if connection.execute(
         "SELECT 1 FROM seen_jobs WHERE id = ?", (stable_id(job),)
+    ).fetchone():
+        return True
+    if connection.execute(
+        "SELECT 1 FROM seen_fingerprints WHERE fingerprint = ?", (job_fingerprint(job),)
     ).fetchone():
         return True
     url = canonical_url(job)
@@ -245,11 +274,80 @@ def record_jobs(connection: sqlite3.Connection, jobs: list[dict]) -> None:
         "INSERT OR IGNORE INTO seen_urls(url) VALUES (?)",
         [(url,) for job in jobs if (url := canonical_url(job))],
     )
+    connection.executemany(
+        "INSERT OR IGNORE INTO seen_fingerprints(fingerprint) VALUES (?)",
+        [(job_fingerprint(job),) for job in jobs],
+    )
 
 
 def load_boards() -> list[dict]:
     boards = json.loads(BOARDS_PATH.read_text()) if BOARDS_PATH.exists() else []
     return [board for board in boards if board.get("provider") in SUPPORTED_PROVIDERS]
+
+
+def board_interval_seconds(relevant_count: int, match_count: int) -> int:
+    if match_count > 0 or relevant_count >= 3:
+        return 5 * 60
+    if relevant_count > 0:
+        return 30 * 60
+    return 2 * 60 * 60
+
+
+def select_due_boards(
+    connection: sqlite3.Connection,
+    boards: list[dict],
+    now: int | None = None,
+) -> list[dict]:
+    current_time = int(time.time()) if now is None else now
+    stats = {
+        row[0]: {"last_checked": row[1], "relevant_count": row[2], "match_count": row[3]}
+        for row in connection.execute(
+            "SELECT board_key, last_checked, relevant_count, match_count FROM board_stats"
+        )
+    }
+    due = []
+    for board in boards:
+        board_key = f'{board["provider"]}:{board["slug"]}'
+        board_stats = stats.get(board_key)
+        if board_stats is None:
+            next_check = 0
+        else:
+            next_check = board_stats["last_checked"] + board_interval_seconds(
+                board_stats["relevant_count"], board_stats["match_count"]
+            )
+        if next_check <= current_time:
+            due.append((next_check, board_key, board))
+    due.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in due[:ATS_BATCH_SIZE]]
+
+
+def record_board_success(
+    connection: sqlite3.Connection,
+    board: dict,
+    relevant_count: int,
+    match_count: int,
+    checked_at: int,
+) -> None:
+    board_key = f'{board["provider"]}:{board["slug"]}'
+    connection.execute(
+        "INSERT INTO board_stats(board_key, last_checked, relevant_count, match_count, failure_count) "
+        "VALUES (?, ?, ?, ?, 0) ON CONFLICT(board_key) DO UPDATE SET "
+        "last_checked=excluded.last_checked, relevant_count=excluded.relevant_count, "
+        "match_count=excluded.match_count, failure_count=0",
+        (board_key, checked_at, relevant_count, match_count),
+    )
+
+
+def record_board_failure(
+    connection: sqlite3.Connection, board: dict, checked_at: int
+) -> None:
+    board_key = f'{board["provider"]}:{board["slug"]}'
+    connection.execute(
+        "INSERT INTO board_stats(board_key, last_checked, failure_count) VALUES (?, ?, 1) "
+        "ON CONFLICT(board_key) DO UPDATE SET "
+        "last_checked=excluded.last_checked, failure_count=failure_count+1",
+        (board_key, checked_at),
+    )
 
 
 def plain_text(value: str) -> str:
@@ -284,10 +382,18 @@ def direct_job(
     }
 
 
-def fetch_json(url: str) -> object:
+def fetch_json(url: str, data: bytes | None = None) -> object:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "personal-new-grad-job-watcher/1.0",
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": "personal-new-grad-job-watcher/1.0"},
+        data=data,
+        headers=headers,
+        method="POST" if data is not None else "GET",
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         return json.load(response)
@@ -406,27 +512,134 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
     return board, normalized
 
 
-def fetch_direct_batch(boards: list[dict]) -> list[tuple[dict, list[dict]]]:
-    if not boards:
-        return []
-    cursor = int(CURSOR_PATH.read_text().strip() or "0") if CURSOR_PATH.exists() else 0
-    start = cursor % len(boards)
-    count = min(ATS_BATCH_SIZE, len(boards))
-    selected = [boards[(start + offset) % len(boards)] for offset in range(count)]
-    CURSOR_PATH.write_text(str((start + count) % len(boards)))
+def aggregator_job(
+    source: str,
+    job_id: object,
+    title: str,
+    company: str,
+    location: str,
+    url: str,
+    description: str,
+) -> dict:
+    return {
+        "source": source,
+        "board_key": f"aggregator:{source}",
+        "id": f"{source}:{job_id}",
+        "title": title,
+        "company_name": company,
+        "locations": [location, "United States"],
+        "url": url,
+        "description": description,
+        "active": True,
+        "is_visible": True,
+    }
+
+
+def fetch_adzuna_jobs(app_id: str, app_key: str) -> list[dict]:
+    query = urllib.parse.urlencode({
+        "app_id": app_id,
+        "app_key": app_key,
+        "results_per_page": 50,
+        "what": "visa sponsorship",
+        "where": "United States",
+        "sort_by": "date",
+        "content-type": "application/json",
+    })
+    payload = fetch_json(f"https://api.adzuna.com/v1/api/jobs/us/search/1?{query}")
+    jobs = []
+    for item in payload.get("results", []):
+        location = item.get("location") or {}
+        company = item.get("company") or {}
+        jobs.append(aggregator_job(
+            "adzuna",
+            item.get("id"),
+            str(item.get("title", "")),
+            str(company.get("display_name", "Unknown company")),
+            str(location.get("display_name", "United States")),
+            str(item.get("redirect_url", "")),
+            str(item.get("description", "")),
+        ))
+    return jobs
+
+
+def fetch_jooble_jobs(api_key: str) -> list[dict]:
+    body = json.dumps({
+        "keywords": (
+            "visa sponsorship software engineer, data engineer, machine learning engineer, "
+            "AI engineer, data scientist"
+        ),
+        "location": "United States",
+        "page": "1",
+        "ResultOnPage": "50",
+        "companysearch": "false",
+    }).encode()
+    payload = fetch_json(
+        f"https://jooble.org/api/{urllib.parse.quote(api_key, safe='')}", data=body
+    )
+    return [
+        aggregator_job(
+            "jooble",
+            item.get("id"),
+            str(item.get("title", "")),
+            str(item.get("company", "Unknown company")),
+            str(item.get("location", "United States")),
+            str(item.get("link", "")),
+            str(item.get("snippet", "")),
+        )
+        for item in payload.get("jobs", [])
+    ]
+
+
+def fetch_due_aggregators(
+    connection: sqlite3.Connection, now: int
+) -> list[tuple[str, list[dict]]]:
+    configured = []
+    adzuna_id = os.environ.get("JOB_WATCHER_ADZUNA_APP_ID")
+    adzuna_key = os.environ.get("JOB_WATCHER_ADZUNA_APP_KEY")
+    if adzuna_id and adzuna_key:
+        configured.append(("adzuna", lambda: fetch_adzuna_jobs(adzuna_id, adzuna_key)))
+    jooble_key = os.environ.get("JOB_WATCHER_JOOBLE_API_KEY")
+    if jooble_key:
+        configured.append(("jooble", lambda: fetch_jooble_jobs(jooble_key)))
+
+    last_checks = dict(connection.execute("SELECT source, last_checked FROM source_checks"))
     results = []
+    for source, fetcher in configured:
+        if now - int(last_checks.get(source, 0)) < AGGREGATOR_INTERVAL_SECONDS:
+            continue
+        try:
+            results.append((source, fetcher()))
+        except Exception as exc:
+            print(f"Aggregator source failed ({source}): {exc}", file=sys.stderr)
+        finally:
+            connection.execute(
+                "INSERT INTO source_checks(source, last_checked) VALUES (?, ?) "
+                "ON CONFLICT(source) DO UPDATE SET last_checked=excluded.last_checked",
+                (source, now),
+            )
+    return results
+
+
+def fetch_direct_batch(
+    boards: list[dict],
+) -> tuple[list[tuple[dict, list[dict]]], list[dict]]:
+    if not boards:
+        return [], []
+    results = []
+    failures = []
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(fetch_direct_board, board): board for board in selected}
+        futures = {executor.submit(fetch_direct_board, board): board for board in boards}
         for future in as_completed(futures):
             board = futures[future]
             try:
                 results.append(future.result())
             except Exception as exc:
+                failures.append(board)
                 print(
                     f'ATS source failed ({board["provider"]}:{board["slug"]}): {exc}',
                     file=sys.stderr,
                 )
-    return results
+    return results, failures
 
 
 def send_email(jobs: list[dict]) -> None:
@@ -437,12 +650,20 @@ def send_email(jobs: list[dict]) -> None:
     rows = []
     for job in jobs:
         locations = ", ".join(job.get("locations") or ["Location not listed"])
+        source = str(job.get("source", "direct-ats"))
+        if source == "adzuna":
+            source_html = '<a href="https://www.adzuna.com/">Jobs by Adzuna</a>'
+        elif source == "jooble":
+            source_html = "Source: Jooble"
+        else:
+            source_html = "Source: employer career site"
         rows.append(
-            "<li><strong>{}</strong> at {}<br>{}<br>"
+            "<li><strong>{}</strong> at {}<br>{}<br>{}<br>"
             "<a href=\"{}\">Apply</a></li>".format(
                 html.escape(str(job.get("title", "Untitled role"))),
                 html.escape(str(job.get("company_name", "Unknown company"))),
                 html.escape(locations),
+                source_html,
                 html.escape(str(job.get("url", "")), quote=True),
             )
         )
@@ -485,6 +706,22 @@ def send_email(jobs: list[dict]) -> None:
         smtp.send_message(message)
 
 
+def source_candidates(
+    connection: sqlite3.Connection, source_key: str, jobs: list[dict]
+) -> tuple[list[dict], bool]:
+    matching = [job for job in jobs if matches(job)]
+    initialized = connection.execute(
+        "SELECT 1 FROM initialized_boards WHERE board_key = ?", (source_key,)
+    ).fetchone()
+    if not initialized:
+        record_jobs(connection, matching)
+        connection.execute(
+            "INSERT OR IGNORE INTO initialized_boards(board_key) VALUES (?)", (source_key,)
+        )
+        return [], True
+    return [job for job in matching if not job_seen(connection, job)], False
+
+
 def main() -> int:
     if "--test-email" in sys.argv:
         send_email([{
@@ -499,25 +736,33 @@ def main() -> int:
     boards = load_boards()
     if not boards:
         raise RuntimeError("No approved ATS boards are configured")
-    direct_results = fetch_direct_batch(boards)
     with connect_db() as connection:
+        checked_at = int(time.time())
+        due_boards = select_due_boards(connection, boards, checked_at)
+        direct_results, failed_boards = fetch_direct_batch(due_boards)
+        aggregator_results = fetch_due_aggregators(connection, checked_at)
         candidates = []
         initialized_count = 0
         for board, direct_jobs in direct_results:
             board_key = f'{board["provider"]}:{board["slug"]}'
-            matching = [job for job in direct_jobs if matches(job)]
-            initialized = connection.execute(
-                "SELECT 1 FROM initialized_boards WHERE board_key = ?", (board_key,)
-            ).fetchone()
-            if not initialized:
-                record_jobs(connection, matching)
-                connection.execute(
-                    "INSERT OR IGNORE INTO initialized_boards(board_key) VALUES (?)",
-                    (board_key,),
-                )
-                initialized_count += 1
-                continue
-            candidates.extend(job for job in matching if not job_seen(connection, job))
+            relevant_count = sum(1 for job in direct_jobs if potential_match(job))
+            match_count = sum(1 for job in direct_jobs if matches(job))
+            record_board_success(
+                connection, board, relevant_count, match_count, checked_at
+            )
+            new_candidates, was_initialized = source_candidates(
+                connection, board_key, direct_jobs
+            )
+            candidates.extend(new_candidates)
+            initialized_count += int(was_initialized)
+        for board in failed_boards:
+            record_board_failure(connection, board, checked_at)
+        for source, jobs in aggregator_results:
+            new_candidates, was_initialized = source_candidates(
+                connection, f"aggregator:{source}", jobs
+            )
+            candidates.extend(new_candidates)
+            initialized_count += int(was_initialized)
 
         new_jobs = []
         candidate_keys = set()
@@ -530,8 +775,9 @@ def main() -> int:
             send_email(new_jobs)
         record_jobs(connection, new_jobs)
     print(
-        f"Checked {len(direct_results)} ATS boards; initialized {initialized_count}; "
-        f"recorded {len(new_jobs)} new matching jobs"
+        f"Selected {len(due_boards)} ATS boards; checked {len(direct_results)}; "
+        f"failed {len(failed_boards)}; aggregators {len(aggregator_results)}; "
+        f"initialized {initialized_count}; recorded {len(new_jobs)} new matching jobs"
     )
     return 0
 

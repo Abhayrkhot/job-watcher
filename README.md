@@ -5,10 +5,12 @@ US-remote entry-level technical roles that explicitly offer sponsorship. SQLite
 state prevents duplicate mail.
 
 The watcher polls a reviewed registry of employer career boards through public
-Greenhouse, Lever, Ashby, and SmartRecruiters APIs. It rotates through 100 boards
-per run, so the current board set is covered roughly every 50 minutes. A board's
-first successful poll creates a silent baseline; only later matching postings are
-mailed. Roles must contain explicit positive visa-sponsorship language.
+Greenhouse, Lever, Ashby, and SmartRecruiters APIs. Each run checks up to 200 due
+boards. Boards with several relevant roles or a sponsorship match run every five
+minutes, boards with some relevant roles run every 30 minutes, and quiet boards run
+every two hours. A board's first successful poll creates a silent baseline; only
+later matching postings are mailed. Roles must contain explicit positive
+visa-sponsorship language.
 
 See `SOURCE_POLICY.md` for the source allowlist and rules prohibiting restricted
 scraping, browser automation, cookies, private endpoints, and access-control bypass.
@@ -33,6 +35,15 @@ these repository Actions secrets:
 
 - `JOB_WATCHER_TO`: destination email address
 - `JOB_WATCHER_RESEND_API_KEY`: Resend API key
+
+Optional approved aggregator secrets:
+
+- `JOB_WATCHER_ADZUNA_APP_ID` and `JOB_WATCHER_ADZUNA_APP_KEY`
+- `JOB_WATCHER_JOOBLE_API_KEY`
+
+Register through <https://developer.adzuna.com/> and <https://jooble.org/api/about>.
+The watcher checks configured aggregators every 15 minutes. Never commit or paste
+their keys into issues, source files, or chat.
 
 Scheduled Actions can be delayed or dropped during GitHub load. The workflow is a
 free best-effort scheduler, not a guaranteed five-minute service.

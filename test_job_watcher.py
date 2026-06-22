@@ -1,11 +1,15 @@
+import sqlite3
 import unittest
 from unittest.mock import patch
 
 from job_watcher import (
     canonical_url,
+    fetch_adzuna_jobs,
     description_offers_sponsorship,
     fetch_direct_board,
+    fetch_jooble_jobs,
     matches,
+    select_due_boards,
 )
 
 
@@ -22,7 +26,7 @@ class MatchTests(unittest.TestCase):
         self.assertTrue(matches(self.job("Data Scientist - Entry Level")))
 
     def test_exclusions(self):
-        self.assertFalse(matches(self.job("Senior Machine Learning Engineer", "AI/ML/Data")))
+        self.assertFalse(matches(self.job("Senior Machine Learning Engineer")))
         self.assertFalse(matches(self.job("Software Engineer Intern")))
         self.assertFalse(matches(self.job("Software Engineer", active=False)))
 
@@ -105,6 +109,71 @@ class MatchTests(unittest.TestCase):
         _, jobs = fetch_direct_board({"provider": "smartrecruiters", "slug": "Acme"})
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["company_name"], "Acme")
+        self.assertTrue(matches(jobs[0]))
+
+    def test_adaptive_board_schedule(self):
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            "CREATE TABLE board_stats (board_key TEXT PRIMARY KEY, last_checked INTEGER, "
+            "relevant_count INTEGER, match_count INTEGER, failure_count INTEGER)"
+        )
+        boards = [
+            {"provider": "greenhouse", "slug": "new"},
+            {"provider": "greenhouse", "slug": "high"},
+            {"provider": "greenhouse", "slug": "medium"},
+            {"provider": "greenhouse", "slug": "quiet"},
+        ]
+        connection.executemany(
+            "INSERT INTO board_stats VALUES (?, ?, ?, ?, 0)",
+            [
+                ("greenhouse:high", 700, 3, 0),
+                ("greenhouse:medium", 0, 1, 0),
+                ("greenhouse:quiet", 900, 0, 0),
+            ],
+        )
+        selected = select_due_boards(connection, boards, now=1000)
+        self.assertEqual(
+            {board["slug"] for board in selected}, {"new", "high"}
+        )
+
+    def test_board_batch_is_capped_at_200(self):
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            "CREATE TABLE board_stats (board_key TEXT PRIMARY KEY, last_checked INTEGER, "
+            "relevant_count INTEGER, match_count INTEGER, failure_count INTEGER)"
+        )
+        boards = [
+            {"provider": "greenhouse", "slug": f"company-{index}"}
+            for index in range(250)
+        ]
+        self.assertEqual(len(select_due_boards(connection, boards, now=1000)), 200)
+
+    @patch("job_watcher.fetch_json")
+    def test_adzuna_normalization(self, fetch_json):
+        fetch_json.return_value = {"results": [{
+            "id": "a1",
+            "title": "Data Engineer - New Grad",
+            "company": {"display_name": "Acme"},
+            "location": {"display_name": "Austin, TX"},
+            "redirect_url": "https://example.com/a1",
+            "description": "Entry-level role with visa sponsorship available.",
+        }]}
+        jobs = fetch_adzuna_jobs("app", "key")
+        self.assertEqual(jobs[0]["source"], "adzuna")
+        self.assertTrue(matches(jobs[0]))
+
+    @patch("job_watcher.fetch_json")
+    def test_jooble_normalization(self, fetch_json):
+        fetch_json.return_value = {"jobs": [{
+            "id": "j1",
+            "title": "Software Engineer I",
+            "company": "Acme",
+            "location": "Remote",
+            "link": "https://example.com/j1",
+            "snippet": "Entry-level role offering H-1B visa sponsorship.",
+        }]}
+        jobs = fetch_jooble_jobs("key")
+        self.assertEqual(jobs[0]["source"], "jooble")
         self.assertTrue(matches(jobs[0]))
 
 

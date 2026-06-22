@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Restore persistent state
         shell: bash
@@ -41,6 +41,9 @@ jobs:
         env:
           JOB_WATCHER_TO: ${{ secrets.JOB_WATCHER_TO }}
           JOB_WATCHER_RESEND_API_KEY: ${{ secrets.JOB_WATCHER_RESEND_API_KEY }}
+          JOB_WATCHER_ADZUNA_APP_ID: ${{ secrets.JOB_WATCHER_ADZUNA_APP_ID }}
+          JOB_WATCHER_ADZUNA_APP_KEY: ${{ secrets.JOB_WATCHER_ADZUNA_APP_KEY }}
+          JOB_WATCHER_JOOBLE_API_KEY: ${{ secrets.JOB_WATCHER_JOOBLE_API_KEY }}
         shell: bash
         run: |
           test -n "$JOB_WATCHER_TO"
@@ -61,8 +64,7 @@ jobs:
       - name: Persist state
         shell: bash
         run: |
-          tar -czf /tmp/state.tar.gz -C state \
-            ats_boards.json ats_cursor.txt jobs.sqlite3
+          tar -czf /tmp/state.tar.gz -C state ats_boards.json jobs.sqlite3
           git config user.name github-actions
           git config user.email github-actions@github.com
           git checkout --orphan job-watcher-state-next

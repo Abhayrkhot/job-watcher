@@ -20,9 +20,9 @@ be reviewed before adding a source.
 ## Optional Approved Sources
 
 - Adzuna: API key required. Personal research is permitted; default limit is 250
-  calls/day. Attribution requirements apply.
-- Jooble: API key approval required. Only the REST API may be used; its website must
-  not be crawled or automated.
+  calls/day. The connector makes at most 96 calls/day and includes attribution.
+- Jooble: API key approval required. Only the REST API is called at a conservative
+  15-minute cadence; its website is never crawled or automated.
 - Recruitee: its documented unauthenticated Careers Site API may be added when a
   relevant active board is available for validation.
 - LinkedIn and Jobright: native alerts only. No crawling, browser automation, cookie
