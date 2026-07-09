@@ -1,3 +1,17 @@
 .env
 state/
 __pycache__/
+
+# local backup files
+*.pre_*_backup
+
+# local state and secrets
+.env
+.env.*
+state/
+*.sqlite3
+*.db
+*.log
+*.ics
+__pycache__/
+*.pyc

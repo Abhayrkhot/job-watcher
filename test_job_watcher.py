@@ -1,7 +1,11 @@
 import sqlite3
 import unittest
+import json
 import time
 from unittest.mock import patch
+from datetime import datetime, timezone
+
+RECENT_TEST_DATE = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 from job_watcher import (
     canonical_url,
@@ -180,7 +184,7 @@ class MatchTests(unittest.TestCase):
                     "name": "Software Engineer - New Grad",
                     "location": {"fullLocation": "Austin, TX", "country": "us"},
                     "company": {"name": "Acme"},
-                    "createdOn": "2026-06-22T10:00:00Z",
+                    "createdOn": RECENT_TEST_DATE,
                 }],
             },
             {
@@ -189,7 +193,7 @@ class MatchTests(unittest.TestCase):
                 "location": {"fullLocation": "Austin, TX", "country": "us"},
                 "company": {"name": "Acme"},
                 "applyUrl": "https://jobs.smartrecruiters.com/Acme/42",
-                "createdOn": "2026-06-22T10:00:00Z",
+                "createdOn": RECENT_TEST_DATE,
                 "jobAd": {"sections": {"qualifications": {
                     "text": "Applicants must be authorized to work in the U.S."
                 }}},
@@ -282,12 +286,15 @@ class MatchTests(unittest.TestCase):
 
     @patch("job_watcher.fetch_text")
     def test_approved_feed_normalization_does_not_assume_us(self, fetch_text):
-        fetch_text.return_value = '''{"items":[{
-            "id":"1", "title":"Software Engineer - New Grad",
-            "company":"Acme", "location":"Toronto, Canada",
-            "url":"https://example.com/1", "content_text":"Entry-level role.",
-            "date_published":"2026-06-22T10:00:00Z"
-        }]}'''
+        fetch_text.return_value = json.dumps({"items": [{
+            "id": "1",
+            "title": "Software Engineer - New Grad",
+            "company": "Acme",
+            "location": "Toronto, Canada",
+            "url": "https://example.com/1",
+            "content_text": "Entry-level role.",
+            "date_published": RECENT_TEST_DATE,
+        }]})
         jobs = fetch_feed_jobs({
             "name": "example", "url": "https://example.com/feed.json",
             "approved": True, "us_only": False,
@@ -297,12 +304,12 @@ class MatchTests(unittest.TestCase):
 
     @patch("job_watcher.fetch_text")
     def test_jazzhr_customer_xml_feed_normalization(self, fetch_text):
-        fetch_text.return_value = """<jobs><job>
+        fetch_text.return_value = f"""<jobs><job>
             <title>Data Scientist - New Grad</title><company>Acme</company>
             <city>Boston</city><state>MA</state><country>United States</country>
             <url>https://acme.applytojob.com/apply/ABC/data-scientist</url>
             <description>Entry-level data science role.</description>
-            <date>2026-06-22T10:00:00Z</date>
+            <date>{RECENT_TEST_DATE}</date>
         </job></jobs>"""
         jobs = fetch_feed_jobs({
             "name": "acme-jazzhr",
@@ -336,7 +343,7 @@ class MatchTests(unittest.TestCase):
         )
         selected = select_due_boards(connection, boards, now=1000)
         self.assertEqual(
-            {board["slug"] for board in selected}, {"new", "high"}
+            {board["slug"] for board in selected}, {"new"}
         )
 
     def test_board_batch_is_capped_at_200(self):
@@ -355,7 +362,7 @@ class MatchTests(unittest.TestCase):
     def test_failed_boards_retry_with_bounded_backoff(self):
         self.assertEqual(failure_retry_seconds(1), 5 * 60)
         self.assertEqual(failure_retry_seconds(2), 10 * 60)
-        self.assertEqual(failure_retry_seconds(20), 24 * 60 * 60)
+        self.assertEqual(failure_retry_seconds(20), 7 * 24 * 60 * 60)
 
     def test_heartbeat_initializes_on_first_run(self):
         connection = sqlite3.connect(":memory:")
@@ -387,7 +394,7 @@ class MatchTests(unittest.TestCase):
             "location": {"display_name": "Austin, TX"},
             "redirect_url": "https://example.com/a1",
             "description": "Entry-level role with no citizenship requirement.",
-            "created": "2026-06-22T10:00:00Z",
+            "created": RECENT_TEST_DATE,
         }]}
         jobs = fetch_adzuna_jobs("app", "key")
         self.assertEqual(jobs[0]["source"], "adzuna")
@@ -402,7 +409,7 @@ class MatchTests(unittest.TestCase):
             "location": "Remote",
             "link": "https://example.com/j1",
             "snippet": "Entry-level role with no citizenship requirement.",
-            "created": "2026-06-22T10:00:00Z",
+            "created": RECENT_TEST_DATE,
         }]}
         jobs = fetch_jooble_jobs("key")
         self.assertEqual(jobs[0]["source"], "jooble")
@@ -417,11 +424,42 @@ class MatchTests(unittest.TestCase):
             "jobGeo": "USA",
             "url": "https://jobicy.com/jobs/j2",
             "jobDescription": "Entry-level role.",
-            "pubDate": "2026-06-22T10:00:00Z",
+            "pubDate": RECENT_TEST_DATE,
         }]}
         jobs = fetch_jobicy_jobs()
         self.assertEqual(jobs[0]["source"], "jobicy")
         self.assertTrue(matches(jobs[0]))
+
+
+    def test_rejects_roles_requiring_too_much_experience(self):
+        base_job = {
+            "title": "Software Engineer I",
+            "company_name": "Acme",
+            "locations": ["United States"],
+            "url": "https://example.com/job",
+            "posted_at": RECENT_TEST_DATE,
+            "active": True,
+            "is_visible": True,
+        }
+
+        bad_descriptions = [
+            "Entry-level title but requires 2+ years of professional experience.",
+            "Must have at least 3 years of software engineering experience.",
+            "Requires 4 years experience building backend systems.",
+            "Looking for 3-5 years of experience with distributed systems.",
+            "Seeking an experienced engineer with proven experience in production systems.",
+        ]
+
+        for description in bad_descriptions:
+            job = dict(base_job, description=description)
+            self.assertFalse(matches(job), description)
+            self.assertEqual(rejection_reason(job), "too_much_experience")
+
+        good_job = dict(
+            base_job,
+            description="New grad role for candidates with 0-2 years of experience. Applicants must be authorized to work in the U.S.",
+        )
+        self.assertTrue(matches(good_job))
 
     def test_health_report_summarizes_filter_outcomes(self):
         connection = sqlite3.connect(":memory:")

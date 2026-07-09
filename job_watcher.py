@@ -208,10 +208,70 @@ def potential_match(job: dict) -> bool:
     return role_match and entry_match and is_us_location(locations)
 
 
-def matches(job: dict) -> bool:
-    return potential_match(job) and description_mentions_citizenship_requirement(
-        str(job.get("description", ""))
+
+EXPERIENCE_REQUIREMENT_RE = re.compile(
+    r"""
+    (?:
+        (?P<plus>\b\d+\s*\+\s*years?\b) |
+        (?P<range>\b\d+\s*(?:-|to)\s*\d+\s*years?\b) |
+        (?P<minimum>\b(?:minimum|min\.?|at\s+least|requires?|requirement|must\s+have)\s+\d+\s*\+?\s*years?\b) |
+        (?P<plain>\b\d+\s*years?\s+(?:of\s+)?(?:professional\s+)?experience\b)
     )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def asks_for_too_much_experience(text: str) -> bool:
+    lowered = text.lower()
+
+    allowed_patterns = [
+        r"\b0\s*(?:-|to)\s*1\s*years?\b",
+        r"\b0\s*(?:-|to)\s*2\s*years?\b",
+        r"\b1\s*(?:-|to)\s*2\s*years?\b",
+        r"\bup\s+to\s+2\s+years?\b",
+    ]
+    if any(re.search(pattern, lowered) for pattern in allowed_patterns):
+        return False
+
+    for match in EXPERIENCE_REQUIREMENT_RE.finditer(lowered):
+        numbers = [int(value) for value in re.findall(r"\d+", match.group(0))]
+        if not numbers:
+            continue
+
+        phrase = match.group(0)
+
+        # Reject 2+ years, 3+ years, minimum 2 years, minimum 3 years, etc.
+        if "+" in phrase and numbers[0] >= 2:
+            return True
+
+        # Reject ranges whose lower bound starts at 2 or above: 2-4, 3-5, etc.
+        if ("-" in phrase or " to " in phrase) and numbers[0] >= 2:
+            return True
+
+        # Reject explicit minimum/required years >= 2
+        if any(word in phrase for word in ["minimum", "min", "at least", "require", "must have"]) and numbers[0] >= 2:
+            return True
+
+        # Reject plain "3 years of experience", "4 years experience", etc.
+        if numbers[0] > 2:
+            return True
+
+    senior_phrases = [
+        "senior-level experience",
+        "senior level experience",
+        "seasoned engineer",
+        "experienced engineer",
+        "extensive experience",
+        "deep experience",
+        "proven experience",
+        "strong experience building",
+    ]
+    return any(phrase in lowered for phrase in senior_phrases)
+
+
+def matches(job: dict) -> bool:
+    return rejection_reason(job) == "matched"
 
 
 def rejection_reason(job: dict, now: int | None = None) -> str:
@@ -230,6 +290,8 @@ def rejection_reason(job: dict, now: int | None = None) -> str:
     if not any(term in title for term in JOB_FAMILY_TERMS):
         return "outside_role_families"
     description = str(job.get("description", ""))
+    if asks_for_too_much_experience(f"{title} {description}"):
+        return "too_much_experience"
     if not (
         any(term in title for term in ENTRY_TITLE_TERMS)
         or ENTRY_DESCRIPTION_RE.search(description)
@@ -366,16 +428,19 @@ def load_feeds() -> list[dict]:
 
 
 def board_interval_seconds(relevant_count: int, match_count: int) -> int:
-    if match_count > 0 or relevant_count >= 3:
-        return 5 * 60
-    if relevant_count > 0:
+    if match_count > 0:
         return 30 * 60
-    return 2 * 60 * 60
+    if relevant_count >= 3:
+        return 60 * 60
+    if relevant_count > 0:
+        return 3 * 60 * 60
+    return 12 * 60 * 60
 
 
 def failure_retry_seconds(failure_count: int) -> int:
+    if failure_count >= 3:
+        return 7 * 24 * 60 * 60
     return min(5 * 60 * (2 ** max(failure_count - 1, 0)), 24 * 60 * 60)
-
 
 def select_due_boards(
     connection: sqlite3.Connection,
@@ -577,6 +642,15 @@ def job_is_recent(job: dict, now: int | None = None) -> bool:
     return -FUTURE_TIMESTAMP_GRACE_SECONDS <= age <= MAX_JOB_AGE_SECONDS
 
 
+def source_timestamp_is_recent(value: object, now: int | None = None) -> bool:
+    current_time = int(time.time()) if now is None else now
+    timestamp = parse_job_datetime(value)
+    if timestamp is None:
+        return False
+    age = current_time - timestamp
+    return -FUTURE_TIMESTAMP_GRACE_SECONDS <= age <= MAX_JOB_AGE_SECONDS
+
+
 def company_from_slug(slug: str) -> str:
     return re.sub(r"[-_]+", " ", slug).title()
 
@@ -632,6 +706,9 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
             f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
         )
         for item in payload.get("jobs", []):
+            posted_at = item.get("updated_at") or item.get("created_at")
+            if not source_timestamp_is_recent(posted_at):
+                continue
             normalized.append(direct_job(
                 board,
                 item.get("id"),
@@ -639,12 +716,15 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                 [str((item.get("location") or {}).get("name", ""))],
                 str(item.get("absolute_url", "")),
                 plain_text(str(item.get("content", ""))),
-                item.get("updated_at"),
+                posted_at,
             ))
     elif provider in {"lever", "lever-eu"}:
         domain = "api.eu.lever.co" if provider == "lever-eu" else "api.lever.co"
         payload = fetch_json(f"https://{domain}/v0/postings/{slug}?mode=json")
         for item in payload:
+            posted_at = item.get("createdAt") or item.get("created_at") or item.get("updatedAt")
+            if not source_timestamp_is_recent(posted_at):
+                continue
             categories = item.get("categories") or {}
             locations = categories.get("allLocations") or [categories.get("location", "")]
             if item.get("country") == "US":
@@ -661,12 +741,15 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                 [str(location) for location in locations],
                 str(item.get("hostedUrl", "")),
                 description,
-                item.get("createdAt") or item.get("created_at") or item.get("updatedAt"),
+                posted_at,
             ))
     elif provider == "ashby":
         payload = fetch_json(f"https://api.ashbyhq.com/posting-api/job-board/{slug}")
         for item in payload.get("jobs", []):
             if not item.get("isListed", True):
+                continue
+            posted_at = item.get("publishedAt") or item.get("published_at")
+            if not source_timestamp_is_recent(posted_at):
                 continue
             secondary = [
                 str(location.get("location", ""))
@@ -689,7 +772,7 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                 [str(item.get("location", "")), *secondary, *countries],
                 url,
                 str(item.get("descriptionPlain", "")),
-                item.get("publishedAt") or item.get("published_at"),
+                posted_at,
             ))
     elif provider == "smartrecruiters":
         offset = 0
@@ -700,6 +783,13 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
             )
             items = payload.get("content", [])
             for item in items:
+                posted_at = (
+                    item.get("releasedDate")
+                    or item.get("releaseDate")
+                    or item.get("createdOn")
+                )
+                if not source_timestamp_is_recent(posted_at):
+                    continue
                 title = str(item.get("name", ""))
                 lowered_title = title.lower()
                 if not any(term in lowered_title for term in JOB_FAMILY_TERMS):
@@ -730,9 +820,7 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                     detail.get("releasedDate")
                     or detail.get("releaseDate")
                     or detail.get("createdOn")
-                    or item.get("releasedDate")
-                    or item.get("releaseDate")
-                    or item.get("createdOn"),
+                    or posted_at,
                 )
                 job["company_name"] = str(
                     (detail.get("company") or item.get("company") or {}).get("name")
@@ -1068,7 +1156,11 @@ def fetch_direct_batch(
             except Exception as exc:
                 failures.append(board)
                 print(
-                    f'ATS source failed ({board["provider"]}:{board["slug"]}): {exc}',
+                    "ATS source failed "
+                    f'provider={board.get("provider")} '
+                    f'slug={board.get("slug")} '
+                    f'url={board.get("url")} '
+                    f"error={exc}",
                     file=sys.stderr,
                 )
     return results, failures
@@ -1114,10 +1206,34 @@ def deliver_email(subject: str, text_body: str, html_body: str, idempotency_key:
         smtp.send_message(message)
 
 
+
+def display_company_name(value: object) -> str:
+    raw = plain_text(str(value or "Unknown company")).strip()
+    if not raw:
+        return "Unknown company"
+
+    special_names = {
+        "sonyinteractiveentertainmentglobal": "Sony Interactive Entertainment Global",
+        "sony interactive entertainment global": "Sony Interactive Entertainment Global",
+    }
+    normalized = raw.lower().replace("-", " ").replace("_", " ").strip()
+    if normalized in special_names:
+        return special_names[normalized]
+
+    cleaned = raw.replace("_", " ").replace("-", " ").strip()
+    if " " in cleaned:
+        return " ".join(part.capitalize() if part.islower() else part for part in cleaned.split())
+
+    return cleaned
+
+
 def send_email(jobs: list[dict]) -> None:
     subject = f"{len(jobs)} new US tech job{'s' if len(jobs) != 1 else ''}"
     rows = []
-    text_rows = ["Category | Role | Company | Experience | Posted", "-" * 88]
+    text_rows = [
+        f"{'Cat':<8} {'Role':<42} {'Company':<38} {'Experience':<14} {'Posted':<10}",
+        f"{'-' * 8} {'-' * 42} {'-' * 38} {'-' * 14} {'-' * 10}",
+    ]
     category_order = {name: index for index, name in enumerate(
         ("ml", "ai", "data_science", "data", "sde", "robotics", "other")
     )}
@@ -1133,22 +1249,19 @@ def send_email(jobs: list[dict]) -> None:
     for job in jobs:
         category = html.escape(role_category(job))
         role = html.escape(str(job.get("title", "Untitled role")))
-        company = html.escape(str(job.get("company_name", "Unknown company")))
+        company = html.escape(display_company_name(job.get("company_name", "Unknown company")))
         experience = html.escape(experience_summary(job))
         posted = html.escape(relative_posted_time(job))
         url = html.escape(str(job.get("url", "")), quote=True)
+        text_category = plain_text(role_category(job))[:8]
+        text_role = plain_text(str(job.get("title", "Untitled role")))[:42]
+        text_company = display_company_name(job.get("company_name", "Unknown company"))[:38]
+        text_experience = plain_text(experience_summary(job))[:14]
+        text_posted = plain_text(relative_posted_time(job))[:10]
         text_rows.append(
-            f"{role_category(job)} | "
-            f"{plain_text(str(job.get('title', 'Untitled role')))} | "
-            f"{plain_text(str(job.get('company_name', 'Unknown company')))} | "
-            f"{plain_text(experience_summary(job))} | {plain_text(relative_posted_time(job))}"
+            f"{text_category:<8} {text_role:<42} {text_company:<38} {text_experience:<14} {text_posted:<10}"
         )
-        if category != previous_category:
-            rows.append(
-                "<tr><td colspan=\"5\" style=\"padding:12px 8px 6px;background:#f3f4f6;"
-                "font-weight:700;text-transform:uppercase;\">{}</td></tr>".format(category)
-            )
-            previous_category = category
+        previous_category = category
         rows.append(
             "<tr>"
             "<td style=\"padding:10px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;\">{}</td>"
@@ -1219,6 +1332,7 @@ def health_report(connection: sqlite3.Connection, now: int) -> tuple[str, str, s
     ).fetchall()
     totals = Counter()
     rejections = Counter()
+    failures_by_source = Counter()
     sources = set()
     for source, fetched, matched_count, new_count, failures, reasons in rows:
         if source != "notifications":
@@ -1229,6 +1343,8 @@ def health_report(connection: sqlite3.Connection, now: int) -> tuple[str, str, s
             "new": new_count,
             "failures": failures,
         })
+        if failures:
+            failures_by_source[source] += failures
         rejections.update(json.loads(reasons))
     subject = f"Job Watcher daily health: {totals['new']} alerts"
     summary = [
@@ -1239,8 +1355,15 @@ def health_report(connection: sqlite3.Connection, now: int) -> tuple[str, str, s
         f"New jobs emailed: {totals['new']}",
         f"Source failures: {totals['failures']}",
         "",
-        "Filter outcomes:",
+        "Failures by source:",
     ]
+    summary.extend(
+        f"- {source}: {count}"
+        for source, count in failures_by_source.most_common()
+    )
+    if not failures_by_source:
+        summary.append("- none")
+    summary.extend(["", "Filter outcomes:"])
     summary.extend(f"- {key}: {value}" for key, value in rejections.most_common())
     text_body = "\n".join(summary)
     html_body = "<div style=\"font-family:Arial,sans-serif\"><h2>Job Watcher health</h2>" + "".join(
