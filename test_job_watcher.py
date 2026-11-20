@@ -180,6 +180,12 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(relative_posted_time({"posted_at": 100000 - (3 * 60 * 60)}), "3h ago")
         self.assertEqual(relative_posted_time({}), "Unknown")
 
+    def test_parses_recruitee_utc_suffix(self):
+        self.assertEqual(
+            job_watcher.parse_job_datetime("2026-11-19 16:00:31 UTC"),
+            int(datetime(2026, 11, 19, 16, 0, 31, tzinfo=timezone.utc).timestamp()),
+        )
+
     def test_posted_label_shows_when_the_company_posted(self):
         now = int(datetime(2026, 11, 20, 6, 0, tzinfo=timezone.utc).timestamp())
         posted = int(datetime(2026, 11, 20, 3, 4, tzinfo=timezone.utc).timestamp())

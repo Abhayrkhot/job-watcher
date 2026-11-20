@@ -896,6 +896,8 @@ def parse_job_datetime(value: object) -> int | None:
         return int(numeric / 1000 if numeric > 10**12 else numeric)
     if text.endswith("Z"):
         text = f"{text[:-1]}+00:00"
+    elif text.endswith((" UTC", " GMT")):  # Recruitee: "2026-11-19 16:00:31 UTC"
+        text = f"{text[:-4]}+00:00"
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
