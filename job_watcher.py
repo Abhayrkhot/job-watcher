@@ -38,6 +38,8 @@ BOOTSTRAP_FEEDS_PATH = BASE_DIR / "bootstrap" / "feeds.json"
 ATS_BATCH_SIZE = 2000
 HOT_POLL_SECONDS = 2 * 60
 BASE_POLL_SECONDS = 10 * 60
+# Workday hosts throttle (1500+ tenants share a few hosts), so quiet tenants wait longer.
+PROVIDER_BASE_POLL_SECONDS = {"workday": 20 * 60}
 # launchd starts a missed run the moment the Mac wakes, often before DNS is back.
 NETWORK_WAIT_SECONDS = 60
 NETWORK_RETRY_SECONDS = 5
@@ -560,12 +562,12 @@ def load_feeds() -> list[dict]:
     ]
 
 
-def board_interval_seconds(relevant_count: int, match_count: int) -> int:
+def board_interval_seconds(relevant_count: int, match_count: int, provider: str = "") -> int:
     # Unchanged boards answer 304 (or a tiny Workday page), so polling is cheap;
     # boards with roles in our area are checked on every run.
     if match_count > 0 or relevant_count > 0:
         return HOT_POLL_SECONDS
-    return BASE_POLL_SECONDS
+    return PROVIDER_BASE_POLL_SECONDS.get(provider, BASE_POLL_SECONDS)
 
 
 def jittered(seconds: int, board_key: str) -> int:
@@ -610,7 +612,7 @@ def select_due_boards(
             )
         else:
             next_check = board_stats["last_checked"] + jittered(board_interval_seconds(
-                board_stats["relevant_count"], board_stats["match_count"]
+                board_stats["relevant_count"], board_stats["match_count"], board["provider"]
             ), board_key)
         if next_check <= current_time:
             due.append((next_check, board_key, board))
@@ -1143,10 +1145,9 @@ class DetailPlan:
         return jobs
 
 
-WORKDAY_SLOTS = threading.BoundedSemaphore(3)
-WORKDAY_HOST_SPACING_SECONDS = 0.1
-WORKDAY_THROTTLED_SPACING_SECONDS = 1.0
-WORKDAY_MAX_WAIT_SECONDS = 45
+WORKDAY_SLOTS = threading.BoundedSemaphore(2)
+WORKDAY_HOST_SPACING_SECONDS = 0.35
+WORKDAY_MAX_WAIT_SECONDS = 3  # never park a shared worker thread for long
 _workday_lock = threading.Lock()
 _workday_next_slot: dict[str, float] = {}
 _workday_throttled: set[str] = set()
@@ -1154,15 +1155,14 @@ _workday_throttled: set[str] = set()
 
 def workday_fetch(url: str, data: bytes | None = None) -> object:
     """Pace requests per Workday host (tenants share hosts; wd3 throttles hardest).
-    A 429 widens that host's spacing for the rest of the run; the board itself is
-    marked transient and polled again later."""
+    After a 429, or when the host is backed up, the board is deferred (transient)
+    and polled on a later run instead of waiting."""
     host = urllib.parse.urlsplit(url).netloc.split(".", 1)[-1]
     with _workday_lock:
-        spacing = (WORKDAY_THROTTLED_SPACING_SECONDS if host in _workday_throttled
-                   else WORKDAY_HOST_SPACING_SECONDS)
+        spacing = WORKDAY_HOST_SPACING_SECONDS
         now = time.monotonic()
         start = max(now, _workday_next_slot.get(host, 0.0))
-        if start - now > WORKDAY_MAX_WAIT_SECONDS:
+        if host in _workday_throttled or start - now > WORKDAY_MAX_WAIT_SECONDS:
             # This host is backed up for this run; try the board again on a later run.
             raise urllib.error.HTTPError(url, 429, "Workday host busy this run", None, None)
         _workday_next_slot[host] = start + spacing
