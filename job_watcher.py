@@ -1145,9 +1145,9 @@ class DetailPlan:
         return jobs
 
 
-WORKDAY_SLOTS = threading.BoundedSemaphore(2)
+WORKDAY_WORKERS = 4  # Workday runs in its own pool, so pacing never blocks other boards
 WORKDAY_HOST_SPACING_SECONDS = 0.35
-WORKDAY_MAX_WAIT_SECONDS = 3  # never park a shared worker thread for long
+WORKDAY_MAX_WAIT_SECONDS = 90  # per-run budget per host; later boards wait for the next run
 _workday_lock = threading.Lock()
 _workday_next_slot: dict[str, float] = {}
 _workday_throttled: set[str] = set()
@@ -1168,14 +1168,13 @@ def workday_fetch(url: str, data: bytes | None = None) -> object:
         _workday_next_slot[host] = start + spacing
     if start > now:
         time.sleep(start - now)
-    with WORKDAY_SLOTS:
-        try:
-            return fetch_json(url, data)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 429:
-                with _workday_lock:
-                    _workday_throttled.add(host)
-            raise
+    try:
+        return fetch_json(url, data)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            with _workday_lock:
+                _workday_throttled.add(host)
+        raise
 
 
 def fetch_workday_board(board: dict, now: int) -> list[dict]:
@@ -1946,8 +1945,14 @@ def fetch_direct_batch(
         return [], []
     results = []
     failures = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(fetch_direct_board, board): board for board in boards}
+    workday = [board for board in boards if board.get("provider") == "workday"]
+    others = [board for board in boards if board.get("provider") != "workday"]
+    with ThreadPoolExecutor(max_workers=8) as executor, \
+            ThreadPoolExecutor(max_workers=WORKDAY_WORKERS) as workday_executor:
+        futures = {executor.submit(fetch_direct_board, board): board for board in others}
+        futures.update({
+            workday_executor.submit(fetch_direct_board, board): board for board in workday
+        })
         for future in as_completed(futures):
             board = futures[future]
             try:
