@@ -837,6 +837,8 @@ class MainRunTests(unittest.TestCase):
                 raise socket.timeout("The read operation timed out")
             if board["slug"] == "broken":
                 raise http_error(500)
+            if board["slug"] == "throttled":
+                raise http_error(429)
             return board, []
 
         def fetch_json(url):
@@ -849,6 +851,7 @@ class MainRunTests(unittest.TestCase):
             {"provider": "greenhouse", "slug": "dead"},
             {"provider": "greenhouse", "slug": "slow"},
             {"provider": "greenhouse", "slug": "broken"},
+            {"provider": "workday", "slug": "throttled"},
             *({"provider": "lever", "slug": f"ok-{n}"} for n in range(4)),
         ]
         stats, registry = self.run_main(boards, fetch_board, fetch_json)
@@ -856,6 +859,7 @@ class MainRunTests(unittest.TestCase):
         self.assertEqual(stats["greenhouse:dead"][1], 1)
         self.assertEqual(stats["greenhouse:broken"][1], 1)
         self.assertEqual(stats["greenhouse:slow"][1], 0)
+        self.assertEqual(stats["workday:throttled"][1], 0)  # 429 is not the board's fault
         self.assertNotIn("greenhouse:benchling", stats)
         self.assertIn(
             {"provider": "ashby", "slug": "benchling", "migrated_from": "greenhouse:benchling"},
@@ -1116,6 +1120,28 @@ class DiscoveryTests(unittest.TestCase):
         ]
         found = job_watcher.harvest_boards(listings, {"ashby:known"}, now)
         self.assertEqual(found, [{"provider": "lever", "slug": "acme", "company": "Acme", "source": "simplify"}])
+
+    def test_harvest_skips_denied_and_already_moved_boards(self):
+        now = int(time.time())
+        listings = [
+            {"category": "Software", "date_posted": now, "company_name": "Alma",
+             "url": "https://job-boards.greenhouse.io/alma/jobs/1"},
+            {"category": "Software", "date_posted": now, "company_name": "Benchling",
+             "url": "https://job-boards.greenhouse.io/benchling/jobs/2"},
+        ]
+        boards = [{"provider": "ashby", "slug": "benchling", "migrated_from": "greenhouse:benchling"}]
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE source_checks (source TEXT PRIMARY KEY, last_checked INTEGER)")
+        connection.execute("CREATE TABLE http_cache (url TEXT PRIMARY KEY, etag TEXT)")
+        registry = Path(tempfile.mkdtemp()) / "ats_boards.json"
+        registry.write_text(json.dumps(boards))
+        with patch("job_watcher.fetch_conditional", return_value=json.dumps(listings).encode()):
+            job_watcher.fetch_simplify(connection, boards, now, registry)
+        self.assertEqual(json.loads(registry.read_text()), boards)
+        self.assertIsNone(job_watcher.find_migrated_board(
+            {"provider": "greenhouse", "slug": "alma"}, fetch=lambda url: {"jobs": [{"id": 1}]}
+        ))
 
     def test_simplify_listing_citizenship_is_enforced(self):
         now = int(time.time())

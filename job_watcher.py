@@ -15,6 +15,7 @@ import socket
 import sqlite3
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -543,7 +544,11 @@ def record_jobs(connection: sqlite3.Connection, jobs: list[dict]) -> None:
 def load_boards() -> list[dict]:
     path = BOARDS_PATH if BOARDS_PATH.exists() else BOOTSTRAP_BOARDS_PATH
     boards = json.loads(path.read_text()) if path.exists() else []
-    return [board for board in boards if board.get("provider") in SUPPORTED_PROVIDERS]
+    denied = load_board_denylist()
+    return [
+        board for board in boards
+        if board.get("provider") in SUPPORTED_PROVIDERS and registry_key(board) not in denied
+    ]
 
 
 def load_feeds() -> list[dict]:
@@ -659,6 +664,14 @@ def is_network_error(exc: BaseException) -> bool:
         ssl.SSLError,
         http.client.IncompleteRead,
     ))
+
+
+TRANSIENT_HTTP_STATUSES = {429, 502, 503, 504}
+
+
+def is_transient_http_error(exc: BaseException) -> bool:
+    """Throttling or a gateway hiccup: retry later without counting it against the board."""
+    return isinstance(exc, urllib.error.HTTPError) and exc.code in TRANSIENT_HTTP_STATUSES
 
 
 def is_missing_board_error(exc: BaseException) -> bool:
@@ -1123,12 +1136,28 @@ class DetailPlan:
         return jobs
 
 
+WORKDAY_SLOTS = threading.BoundedSemaphore(3)  # tenants share hosts that throttle
+
+
+def workday_fetch(url: str, data: bytes | None = None) -> object:
+    for attempt in range(2):
+        with WORKDAY_SLOTS:
+            try:
+                return fetch_json(url, data)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 429 or attempt:
+                    raise
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+        time.sleep(min(float(retry_after) if retry_after and retry_after.isdigit() else 3.0, 10.0))
+    return {}
+
+
 def fetch_workday_board(board: dict, now: int) -> list[dict]:
     host, tenant, site = str(board["slug"]).split("/", 2)
     base = f"https://{host}/wday/cxs/{tenant}/{site}"
     plan = DetailPlan(board)
     for page in range(WORKDAY_MAX_PAGES):
-        payload = fetch_json(f"{base}/jobs", json.dumps({
+        payload = workday_fetch(f"{base}/jobs", json.dumps({
             "appliedFacets": {}, "limit": WORKDAY_PAGE_SIZE,
             "offset": page * WORKDAY_PAGE_SIZE, "searchText": "",
         }).encode())
@@ -1147,7 +1176,7 @@ def fetch_workday_board(board: dict, now: int) -> list[dict]:
 
     def one(job_id, payload):
         path, posting = payload
-        info = (fetch_json(base + path) or {}).get("jobPostingInfo") or {}
+        info = (workday_fetch(base + path) or {}).get("jobPostingInfo") or {}
         locations = [info.get("location") or posting.get("locationsText")]
         locations += [str(value) for value in info.get("additionalLocations") or []]
         locations.append((info.get("country") or {}).get("descriptor"))
@@ -1517,8 +1546,25 @@ def write_registry(boards: list[dict], registry_path: Path) -> None:
     os.replace(temporary, registry_path)
 
 
+# Boards never to add back or migrate: slugs that belong to a different company
+# elsewhere. Extend in state/board_denylist.json (a JSON list of provider:slug keys).
+DEFAULT_BOARD_DENYLIST = ("greenhouse:alma", "ashby:alma")
+BOARD_DENYLIST_PATH = STATE_DIR / "board_denylist.json"
+
+
+def load_board_denylist() -> set[str]:
+    keys = list(DEFAULT_BOARD_DENYLIST)
+    try:
+        if BOARD_DENYLIST_PATH.exists():
+            keys += json.loads(BOARD_DENYLIST_PATH.read_text())
+    except (OSError, ValueError) as exc:
+        print(f"job-watcher: ignoring unreadable {BOARD_DENYLIST_PATH}: {exc}", file=sys.stderr)
+    return {str(key).lower() for key in keys}
+
+
 def harvest_boards(listings: list[dict], known_keys: set[str], now: int) -> list[dict]:
     found = []
+    known_keys |= load_board_denylist()
     for listing in listings:
         if listing.get("category") not in HARVEST_CATEGORIES:
             continue
@@ -1589,6 +1635,7 @@ def fetch_simplify(
 ) -> list[tuple[str, list[dict]]]:
     last_checks = dict(connection.execute("SELECT source, last_checked FROM source_checks"))
     known = {registry_key(board) for board in boards}
+    known |= {str(board["migrated_from"]).lower() for board in boards if board.get("migrated_from")}
     new_boards: list[dict] = []
     results = []
     for name, url in SIMPLIFY_LISTINGS.items():
@@ -1897,6 +1944,9 @@ def find_migrated_board(board: dict, fetch=None) -> dict | None:
     fetch = fetch or fetch_json
     if "/" in str(board["slug"]):
         return None
+    denied = load_board_denylist()
+    if registry_key(board) in denied:
+        return None
     old_key = f'{board["provider"]}:{board["slug"]}'
     family = "lever" if board["provider"].startswith("lever") else board["provider"]
     slug = urllib.parse.quote(board["slug"], safe="")
@@ -1913,6 +1963,8 @@ def find_migrated_board(board: dict, fetch=None) -> dict | None:
             jobs = payload
         else:
             jobs = []
+        if f'{provider}:{str(board["slug"]).lower()}' in denied:
+            continue
         if any(isinstance(job, dict) and job.get("isListed", True) for job in jobs):
             return {"provider": provider, "slug": board["slug"], "migrated_from": old_key}
     return None
@@ -2784,9 +2836,13 @@ def main() -> int:
         unreachable_boards = [
             board for board, exc in failed_boards if is_network_error(exc)
         ]
+        transient_boards = [
+            board for board, exc in failed_boards if is_transient_http_error(exc)
+        ]
         broken_boards = [
             board for board, exc in failed_boards
             if not is_missing_board_error(exc) and not is_network_error(exc)
+            and not is_transient_http_error(exc)
         ]
         outage = network_outage(len(direct_results), len(unreachable_boards))
         if outage:
@@ -2829,6 +2885,8 @@ def main() -> int:
             initialized_count += int(was_initialized)
         for board in broken_boards:
             record_board_failure(connection, board, checked_at)
+        for board in transient_boards:
+            record_board_unreachable(connection, board, checked_at)
         if not outage:
             for board in unreachable_boards:
                 record_board_unreachable(connection, board, checked_at)
