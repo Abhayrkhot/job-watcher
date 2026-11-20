@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import hashlib
 import html
+import http.client
 import json
 import os
 import re
 import smtplib
+import socket
 import sqlite3
 import ssl
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -31,6 +34,17 @@ FEEDS_PATH = STATE_DIR / "feeds.json"
 BOOTSTRAP_BOARDS_PATH = BASE_DIR / "bootstrap" / "ats_boards.json"
 BOOTSTRAP_FEEDS_PATH = BASE_DIR / "bootstrap" / "feeds.json"
 ATS_BATCH_SIZE = 200
+# launchd starts a missed run the moment the Mac wakes, often before DNS is back.
+NETWORK_WAIT_SECONDS = 60
+NETWORK_RETRY_SECONDS = 5
+NETWORK_CHECK_HOSTS = ("boards-api.greenhouse.io", "api.lever.co", "api.ashbyhq.com")
+# Companies often keep their slug when they switch ATS, so a board that starts
+# returning 404 is probed under the same slug on the other public APIs.
+MIGRATION_PROBE_URLS = {
+    "greenhouse": "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs",
+    "ashby": "https://api.ashbyhq.com/posting-api/job-board/{slug}",
+    "lever": "https://api.lever.co/v0/postings/{slug}?mode=json&limit=1",
+}
 AGGREGATOR_INTERVAL_SECONDS = 15 * 60
 AGGREGATOR_INTERVALS = {"jobicy": 6 * 60 * 60}
 FEED_INTERVAL_SECONDS = 15 * 60
@@ -195,6 +209,8 @@ def potential_match(job: dict) -> bool:
     if not job.get("active") or not job.get("is_visible", True):
         return False
     if not job_is_recent(job):
+        return False
+    if not digest_has_real_recent_posted_time(job):
         return False
     title = str(job.get("title", "")).lower()
     if any(term in title for term in EXCLUDED_TERMS):
@@ -507,6 +523,68 @@ def record_board_failure(
         "last_checked=excluded.last_checked, failure_count=failure_count+1",
         (board_key, checked_at),
     )
+
+
+def record_board_unreachable(
+    connection: sqlite3.Connection, board: dict, checked_at: int
+) -> None:
+    """Count a lone network error as a check that found nothing, not a board failure."""
+    board_key = f'{board["provider"]}:{board["slug"]}'
+    connection.execute(
+        "INSERT INTO board_stats(board_key, last_checked) VALUES (?, ?) "
+        "ON CONFLICT(board_key) DO UPDATE SET last_checked=excluded.last_checked",
+        (board_key, checked_at),
+    )
+
+
+def is_network_error(exc: BaseException) -> bool:
+    """True for errors that say nothing about the board: DNS, resets, TLS, timeouts."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    return isinstance(exc, (
+        urllib.error.URLError,
+        socket.timeout,
+        TimeoutError,
+        ConnectionError,
+        ssl.SSLError,
+        http.client.IncompleteRead,
+    ))
+
+
+def is_missing_board_error(exc: BaseException) -> bool:
+    return isinstance(exc, urllib.error.HTTPError) and exc.code in {404, 410}
+
+
+def network_outage(success_count: int, unreachable_count: int) -> bool:
+    """A batch where network errors outnumber successes means we were offline."""
+    if unreachable_count == 0:
+        return False
+    return success_count == 0 or unreachable_count >= max(3, success_count)
+
+
+def network_available(hosts: tuple[str, ...] = NETWORK_CHECK_HOSTS) -> bool:
+    for host in hosts:
+        try:
+            socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+        except OSError:
+            continue
+        return True
+    return False
+
+
+def wait_for_network(
+    hosts: tuple[str, ...] = NETWORK_CHECK_HOSTS,
+    timeout: float = NETWORK_WAIT_SECONDS,
+    interval: float = NETWORK_RETRY_SECONDS,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> bool:
+    deadline = clock() + timeout
+    while not network_available(hosts):
+        if clock() >= deadline:
+            return False
+        sleep(interval)
+    return True
 
 
 def plain_text(value: str) -> str:
@@ -1142,7 +1220,7 @@ def record_heartbeat(connection: sqlite3.Connection, now: int) -> None:
 
 def fetch_direct_batch(
     boards: list[dict],
-) -> tuple[list[tuple[dict, list[dict]]], list[dict]]:
+) -> tuple[list[tuple[dict, list[dict]]], list[tuple[dict, Exception]]]:
     if not boards:
         return [], []
     results = []
@@ -1154,7 +1232,7 @@ def fetch_direct_batch(
             try:
                 results.append(future.result())
             except Exception as exc:
-                failures.append(board)
+                failures.append((board, exc))
                 print(
                     "ATS source failed "
                     f'provider={board.get("provider")} '
@@ -1164,6 +1242,80 @@ def fetch_direct_batch(
                     file=sys.stderr,
                 )
     return results, failures
+
+
+def find_migrated_board(board: dict, fetch=None) -> dict | None:
+    """Return the same slug on another ATS if it has listed jobs there."""
+    fetch = fetch or fetch_json
+    old_key = f'{board["provider"]}:{board["slug"]}'
+    family = "lever" if board["provider"].startswith("lever") else board["provider"]
+    slug = urllib.parse.quote(board["slug"], safe="")
+    for provider, template in MIGRATION_PROBE_URLS.items():
+        if provider == family:
+            continue
+        try:
+            payload = fetch(template.format(slug=slug))
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            jobs = payload.get("jobs") or []
+        elif isinstance(payload, list):
+            jobs = payload
+        else:
+            jobs = []
+        if any(isinstance(job, dict) and job.get("isListed", True) for job in jobs):
+            return {"provider": provider, "slug": board["slug"], "migrated_from": old_key}
+    return None
+
+
+def find_board_migrations(boards: list[dict]) -> list[tuple[dict, dict | None]]:
+    if not boards:
+        return []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        return list(zip(boards, executor.map(find_migrated_board, boards)))
+
+
+def save_board_migration(old_board: dict, new_board: dict, registry_path: Path) -> None:
+    source = registry_path if registry_path.exists() else BOOTSTRAP_BOARDS_PATH
+    boards = json.loads(source.read_text())
+    old_key = f'{old_board["provider"]}:{old_board["slug"]}'
+    new_key = f'{new_board["provider"]}:{new_board["slug"]}'
+    updated = []
+    replaced = False
+    for board in boards:
+        key = f'{board.get("provider")}:{board.get("slug")}'
+        if key == new_key:
+            continue
+        if key == old_key:
+            updated.append({**board, **new_board})
+            replaced = True
+        else:
+            updated.append(board)
+    if not replaced:
+        updated.append(new_board)
+    temporary = registry_path.with_name(f".{registry_path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(updated, indent=2) + "\n")
+    os.replace(temporary, registry_path)
+
+
+def apply_board_migration(
+    connection: sqlite3.Connection,
+    old_board: dict,
+    new_board: dict,
+    registry_path: Path,
+) -> None:
+    old_key = f'{old_board["provider"]}:{old_board["slug"]}'
+    new_key = f'{new_board["provider"]}:{new_board["slug"]}'
+    # The company was already baselined under its old board; don't swallow its
+    # fresh jobs as a second silent baseline.
+    if connection.execute(
+        "SELECT 1 FROM initialized_boards WHERE board_key = ?", (old_key,)
+    ).fetchone():
+        connection.execute(
+            "INSERT OR IGNORE INTO initialized_boards(board_key) VALUES (?)", (new_key,)
+        )
+    connection.execute("DELETE FROM board_stats WHERE board_key = ?", (old_key,))
+    save_board_migration(old_board, new_board, registry_path)
 
 
 def deliver_email(subject: str, text_body: str, html_body: str, idempotency_key: str) -> None:
@@ -1227,8 +1379,8 @@ def display_company_name(value: object) -> str:
     return cleaned
 
 
-def send_email(jobs: list[dict]) -> None:
-    subject = f"{len(jobs)} new US tech job{'s' if len(jobs) != 1 else ''}"
+def send_email(jobs: list[dict], subject_prefix: str = "") -> None:
+    subject = f"{subject_prefix}{len(jobs)} new US tech job{'s' if len(jobs) != 1 else ''}"
     rows = []
     text_rows = [
         f"{'Cat':<8} {'Role':<42} {'Company':<38} {'Experience':<14} {'Posted':<10}",
@@ -1294,9 +1446,10 @@ def send_email(jobs: list[dict]) -> None:
         + "</tbody></table></div>"
     )
     text_body = "\n".join(text_rows)
-    idempotency_key = hashlib.sha256(
-        "|".join(sorted(stable_id(job) for job in jobs)).encode()
-    ).hexdigest()
+    idempotency_seed = "|".join(sorted(stable_id(job) for job in jobs))
+    if subject.startswith("Digest:"):
+        idempotency_seed = f"{idempotency_seed}|{int(time.time())}"
+    idempotency_key = hashlib.sha256(idempotency_seed.encode()).hexdigest()
     deliver_email(subject, text_body, html_body, idempotency_key)
 
 
@@ -1432,6 +1585,453 @@ def source_candidates(
         return [], True
     return [job for job in matching if not job_seen(connection, job)], False
 
+DIGEST_TITLE_TERMS = [
+    "software engineer",
+    "software developer",
+    "backend engineer",
+    "frontend engineer",
+    "full stack engineer",
+    "full-stack engineer",
+    "data engineer",
+    "machine learning engineer",
+    "ml engineer",
+    "ai engineer",
+    "platform engineer",
+    "cloud engineer",
+    "infrastructure engineer",
+    "systems engineer",
+    "site reliability engineer",
+    "sre",
+    "devops engineer",
+    "security engineer",
+    "application engineer",
+    "new grad",
+    "university graduate",
+    "early career",
+    "entry level",
+    "associate engineer",
+    "software engineer i",
+    "software developer i",
+]
+
+DIGEST_BLOCKED_TITLE_TERMS = [
+    "senior",
+    "sr.",
+    "sr ",
+    "staff",
+    "principal",
+    "lead",
+    "manager",
+    "director",
+    "architect",
+    "intern",
+    "internship",
+    "co-op",
+    "coop",
+    "student",
+    "phd",
+    "postdoc",
+    "founding engineer",
+    "head of",
+    "vp ",
+    "recruiter",
+    "customer experience",
+    "customer support",
+    "business development",
+    "sales",
+    "finance",
+    "coordinator",
+    "associate, finance",
+    "finance associate",
+    "analyst",
+    "production support",
+    "independent consultant",
+    "w2 position",
+]
+
+
+
+US_STATE_TERMS = [
+    "united states", "usa", "u.s.", "us remote", "remote us", "remote, us",
+    "new york", "ny", "california", "ca", "san francisco", "sf", "bay area",
+    "seattle", "wa", "washington", "boston", "ma", "massachusetts",
+    "austin", "tx", "texas", "dallas", "houston", "chicago", "il",
+    "illinois", "atlanta", "ga", "georgia", "denver", "co", "colorado",
+    "los angeles", "la", "san diego", "palo alto", "sunnyvale",
+    "mountain view", "santa clara", "san jose", "cupertino",
+    "miami", "fl", "florida", "phoenix", "az", "arizona",
+    "portland", "or", "oregon", "raleigh", "nc", "north carolina",
+    "charlotte", "nashville", "tn", "tennessee", "salt lake city", "utah",
+    "arlington", "virginia", "va", "washington dc", "dc",
+]
+
+NON_US_LOCATION_TERMS = [
+    "canada", "toronto", "vancouver", "montreal", "ontario",
+    "united kingdom", "uk", "london", "england", "scotland", "ireland",
+    "europe", "emea", "eu ", "european union", "germany", "berlin", "munich",
+    "france", "paris", "spain", "madrid", "barcelona", "netherlands",
+    "amsterdam", "poland", "warsaw", "sweden", "stockholm",
+    "india", "bangalore", "bengaluru", "hyderabad", "pune", "mumbai",
+    "delhi", "gurgaon", "noida", "chennai",
+    "korea", "south korea", "seoul", "대한민국", "채용관심등록",
+    "japan", "tokyo", "singapore", "australia", "sydney", "melbourne",
+    "new zealand", "mexico", "brazil", "argentina", "latin america",
+    "latam", "israel", "tel aviv", "dubai", "uae",
+]
+
+
+def digest_is_us_location(job: dict) -> bool:
+    locations = job.get("locations") or []
+    location_text = " ".join(str(value) for value in locations).lower()
+    title = str(job.get("title", "")).lower()
+    description = str(job.get("description", "")).lower()
+    combined = f"{title} {location_text} {description}"
+
+    if any(term in combined for term in NON_US_LOCATION_TERMS):
+        return False
+
+    if any(term in location_text for term in US_STATE_TERMS):
+        return True
+
+    # Allow plain remote only when no non-US signal exists.
+    if location_text.strip() in {"remote", "remote - us", "remote us", "remote, us"}:
+        return True
+
+    return False
+
+
+
+SPONSORSHIP_RISK_COMPANIES = {
+    "andurilindustries",
+    "anduril industries",
+    "spacex",
+    "wyetechllc",
+    "wyetech",
+    "syncreon consulting",
+}
+
+SPONSORSHIP_RISK_TITLE_TERMS = [
+    "public sector",
+    "federal",
+    "defense",
+    "dod",
+    "clearance",
+    "security clearance",
+    "itar",
+    "export control",
+    "anti-tamper",
+    "classified",
+    "intelligence systems",
+    "sentry tower",
+    "surveillance tower",
+]
+
+
+def has_sponsorship_risk(job: dict) -> bool:
+    title = plain_text(str(job.get("title", ""))).lower()
+    company = plain_text(str(job.get("company_name", ""))).lower()
+    description = plain_text(str(job.get("description", ""))).lower()
+    combined = f"{title} {company} {description}"
+
+    if company in SPONSORSHIP_RISK_COMPANIES:
+        return True
+
+    if any(term in combined for term in SPONSORSHIP_RISK_TITLE_TERMS):
+        return True
+
+    return False
+
+
+
+def digest_has_real_recent_posted_time(job: dict, now: int | None = None) -> bool:
+    current_time = int(time.time()) if now is None else now
+
+    # Use real posting/publishing fields only.
+    # Do not use updated_at here, because old jobs can be edited/reindexed months later.
+    timestamp_fields = [
+        "posted_at",
+        "published_at",
+        "publishedAt",
+        "created_at",
+        "createdAt",
+    ]
+
+    for field in timestamp_fields:
+        value = job.get(field)
+        if value and source_timestamp_is_recent(value, current_time):
+            return True
+
+    return False
+
+
+def digest_match(job: dict) -> bool:
+    title = str(job.get("title", "")).lower()
+    description = str(job.get("description", ""))
+    locations = " ".join(str(value) for value in job.get("locations", []))
+
+    if not job.get("active", True) or job.get("is_visible") is False:
+        return False
+    if not job_is_recent(job):
+        return False
+    if not digest_is_us_location(job):
+        return False
+    if rejection_reason(job) in {"outside_us", "citizenship_requirement"}:
+        return False
+    if has_sponsorship_risk(job):
+        return False
+    if asks_for_too_much_experience(f"{title} {description}"):
+        return False
+    if any(term in title for term in DIGEST_BLOCKED_TITLE_TERMS):
+        return False
+    if "korea" in locations.lower() or "대한민국" in locations.lower():
+        return False
+
+    engineering_terms = [
+        "software engineer",
+        "software developer",
+        "backend engineer",
+        "frontend engineer",
+        "full stack engineer",
+        "full-stack engineer",
+        "data engineer",
+        "machine learning engineer",
+        "ml engineer",
+        "ai engineer",
+        "platform engineer",
+        "cloud engineer",
+        "infrastructure engineer",
+        "systems engineer",
+        "site reliability engineer",
+        "sre",
+        "devops engineer",
+        "security engineer",
+        "application engineer",
+        "robotics software engineer",
+        "flight software",
+        "embedded",
+    ]
+
+    return any(term in title for term in engineering_terms)
+
+
+def select_digest_boards(connection: sqlite3.Connection, boards: list[dict]) -> list[dict]:
+    failing = {
+        row[0]
+        for row in connection.execute(
+            "SELECT board_key FROM board_stats WHERE failure_count >= 3"
+        )
+    }
+    selected = []
+    for board in boards:
+        key = f'{board.get("provider")}:{board.get("slug")}'
+        if key not in failing:
+            selected.append(board)
+    return selected
+
+
+
+EXA_SEARCH_QUERIES = [
+    'new grad software engineer United States apply careers',
+    'software engineer new graduate United States careers',
+    'software engineer university graduate United States careers',
+    'software engineer early career United States careers',
+    'software engineer I United States careers',
+    'software engineer 1 United States careers',
+    'junior software engineer United States careers',
+    'entry level software engineer United States careers',
+    'backend engineer new grad United States careers',
+    'backend engineer entry level United States careers',
+    'platform engineer new grad United States careers',
+    'infrastructure engineer new grad United States careers',
+    'machine learning engineer new grad United States careers',
+    'AI engineer new grad United States careers',
+    'data engineer new grad United States careers',
+    'systems engineer new grad United States careers',
+]
+
+EXA_INCLUDED_DOMAINS = [
+    "greenhouse.io",
+    "lever.co",
+    "ashbyhq.com",
+    "workdayjobs.com",
+    "myworkdayjobs.com",
+    "smartrecruiters.com",
+    "jobs.lever.co",
+    "job-boards.greenhouse.io",
+]
+
+
+def company_from_url(url: str) -> str:
+    lowered = url.lower()
+    for marker in [
+        "job-boards.greenhouse.io/",
+        "boards.greenhouse.io/",
+        "jobs.lever.co/",
+        "jobs.ashbyhq.com/",
+        "smartrecruiters.com/",
+    ]:
+        if marker in lowered:
+            tail = lowered.split(marker, 1)[1]
+            company = tail.split("/", 1)[0]
+            return display_company_name(company)
+    return "Unknown company"
+
+
+def fetch_exa_jobs(now: int) -> list[dict]:
+    if os.environ.get("EXA_ENABLED") != "1":
+        return []
+
+    api_key = os.environ.get("EXA_API_KEY")
+    if not api_key:
+        return []
+
+    start_date = datetime.fromtimestamp(
+        now - MAX_JOB_AGE_SECONDS,
+        tz=timezone.utc,
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    normalized = []
+    seen_urls = set()
+    raw_count = 0
+
+    for query in EXA_SEARCH_QUERIES:
+        payload = json.dumps({
+            "query": query,
+            "type": "auto",
+            "numResults": 30,
+            "userLocation": "US",
+            "contents": {
+                "text": {
+                    "maxCharacters": 3000
+                },
+                "highlights": True
+            }
+        }).encode()
+
+        request = urllib.request.Request(
+            "https://api.exa.ai/search",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "User-Agent": "personal-new-grad-job-watcher/1.0",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = json.loads(response.read().decode())
+        except Exception as exc:
+            print(f"Exa source failed query={query!r}: {exc}", file=sys.stderr)
+            continue
+
+        results = data.get("results", [])
+        raw_count += len(results)
+
+        for item in results:
+            url = str(item.get("url", "")).strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            title = plain_text(str(item.get("title", "") or "Untitled role"))
+            text_content = plain_text(str(item.get("text", "") or ""))
+            highlights = " ".join(
+                plain_text(str(value))
+                for value in item.get("highlights", []) or []
+            )
+            description = " ".join(part for part in [title, highlights, text_content] if part)
+
+            published = item.get("publishedDate") or item.get("published_date")
+
+            # Be strict for Exa: if Exa does not provide a real published date,
+            # do not pretend the job is new. This prevents 3-6 month old roles
+            # from entering the 24-hour digest.
+            if not published:
+                continue
+
+            if not source_timestamp_is_recent(published, now):
+                continue
+
+            normalized.append({
+                "id": f"exa:{hashlib.sha256(url.encode()).hexdigest()[:16]}",
+                "source": "exa",
+                "title": title,
+                "company_name": company_from_url(url),
+                "locations": ["United States"],
+                "url": url,
+                "description": description,
+                "posted_at": published,
+                "active": True,
+                "is_visible": True,
+            })
+
+    return normalized
+
+
+def send_digest(connection: sqlite3.Connection, boards: list[dict], feeds: list[dict]) -> None:
+    checked_at = int(time.time())
+    digest_boards = select_digest_boards(connection, boards)
+
+    direct_results, failed_boards = fetch_direct_batch(digest_boards)
+    aggregator_results = fetch_due_aggregators(connection, checked_at)
+    feed_results, failed_feeds = fetch_due_feeds(connection, feeds, checked_at)
+    exa_results = fetch_exa_jobs(checked_at)
+
+    all_jobs = []
+    for _, jobs in direct_results:
+        all_jobs.extend(jobs)
+    for _, jobs in aggregator_results:
+        all_jobs.extend(jobs)
+    for _, jobs in feed_results:
+        all_jobs.extend(jobs)
+    all_jobs.extend(exa_results)
+
+    strict_rejections = Counter(rejection_reason(job, checked_at) for job in all_jobs)
+    digest_matches = [job for job in all_jobs if digest_match(job)]
+
+    print("Strict filter outcomes:")
+    for reason, count in strict_rejections.most_common():
+        print(f"- {reason}: {count}")
+    print(f"Broader digest matches: {len(digest_matches)}")
+
+    candidates = digest_matches
+
+    unique_jobs = []
+    seen_keys = set()
+    for job in sorted(
+        candidates,
+        key=lambda item: job_posted_timestamp(item) or 0,
+        reverse=True,
+    ):
+        title_key = plain_text(str(job.get("title", ""))).lower().strip()
+        company_key = plain_text(str(job.get("company_name", ""))).lower().strip()
+
+        # Deduplicate primarily by title + company.
+        # Location-level dedupe caused repeated multi-city postings like Speechify/Anduril.
+        key = f"{title_key}|{company_key}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_jobs.append(job)
+
+    digest_jobs = unique_jobs
+    if not digest_jobs:
+        print(
+            f"Digest found 0 matching jobs; checked {len(direct_results)} ATS boards, "
+            f"failed {len(failed_boards)}, aggregators {len(aggregator_results)}, "
+            f"feeds {len(feed_results)}, exa {len(exa_results)}."
+        )
+        return
+
+    send_email(digest_jobs, subject_prefix="Digest: ")
+    print(
+        f"Digest emailed {len(digest_jobs)} matching jobs; checked {len(direct_results)} ATS boards, "
+        f"failed {len(failed_boards)}, aggregators {len(aggregator_results)}, "
+        f"feeds {len(feed_results)}, exa {len(exa_results)}."
+    )
+
 
 def main() -> int:
     if "--test-email" in sys.argv:
@@ -1454,6 +2054,9 @@ def main() -> int:
             send_health_report_if_due(connection, checked_at, force=True)
             print("Health report accepted by the email provider")
             return 0
+        if "--digest" in sys.argv:
+            send_digest(connection, boards, feeds)
+            return 0
         heartbeat, last_run = heartbeat_message(connection, checked_at)
         print(heartbeat)
         if last_run is not None and checked_at - last_run > HEARTBEAT_GRACE_SECONDS:
@@ -1461,15 +2064,42 @@ def main() -> int:
                 f"job-watcher: missed at least one 5-minute run; gap={checked_at - last_run}s",
                 file=sys.stderr,
             )
+        if not wait_for_network():
+            print(
+                "job-watcher: network unavailable; skipped this run without "
+                "touching board state",
+                file=sys.stderr,
+            )
+            return 0
         due_boards = select_due_boards(connection, boards, checked_at)
         direct_results, failed_boards = fetch_direct_batch(due_boards)
-        aggregator_results = fetch_due_aggregators(connection, checked_at)
-        feed_results, failed_feeds = fetch_due_feeds(connection, feeds, checked_at)
+        missing_boards = [
+            board for board, exc in failed_boards if is_missing_board_error(exc)
+        ]
+        unreachable_boards = [
+            board for board, exc in failed_boards if is_network_error(exc)
+        ]
+        broken_boards = [
+            board for board, exc in failed_boards
+            if not is_missing_board_error(exc) and not is_network_error(exc)
+        ]
+        outage = network_outage(len(direct_results), len(unreachable_boards))
+        if outage:
+            # Aggregators and feeds would fail too and burn their polling slot.
+            print(
+                f"job-watcher: {len(unreachable_boards)} of {len(due_boards)} boards "
+                "unreachable; treating it as a network outage and keeping them due",
+                file=sys.stderr,
+            )
+            aggregator_results, feed_results, failed_feeds = [], [], []
+        else:
+            aggregator_results = fetch_due_aggregators(connection, checked_at)
+            feed_results, failed_feeds = fetch_due_feeds(connection, feeds, checked_at)
         candidates = []
         initialized_count = 0
         metric_jobs: dict[str, list[dict]] = {}
         metric_failures = Counter(
-            f'ats:{board["provider"]}' for board in failed_boards
+            f'ats:{board["provider"]}' for board, _ in failed_boards
         )
         for board, direct_jobs in direct_results:
             board_key = f'{board["provider"]}:{board["slug"]}'
@@ -1484,8 +2114,22 @@ def main() -> int:
             )
             candidates.extend(new_candidates)
             initialized_count += int(was_initialized)
-        for board in failed_boards:
+        for board in broken_boards:
             record_board_failure(connection, board, checked_at)
+        if not outage:
+            for board in unreachable_boards:
+                record_board_unreachable(connection, board, checked_at)
+        moved_count = 0
+        for old_board, new_board in find_board_migrations(missing_boards):
+            if new_board is None:
+                record_board_failure(connection, old_board, checked_at)
+                continue
+            apply_board_migration(connection, old_board, new_board, BOARDS_PATH)
+            moved_count += 1
+            print(
+                f'Board moved: {new_board["migrated_from"]} -> '
+                f'{new_board["provider"]}:{new_board["slug"]}'
+            )
         for source, jobs in aggregator_results:
             metric_jobs.setdefault(f"aggregator:{source}", []).extend(jobs)
             new_candidates, was_initialized = source_candidates(
@@ -1539,7 +2183,9 @@ def main() -> int:
                 print(f"Health report failed: {exc}", file=sys.stderr)
     print(
         f"Selected {len(due_boards)} ATS boards; checked {len(direct_results)}; "
-        f"failed {len(failed_boards)}; aggregators {len(aggregator_results)}; "
+        f"failed {len(failed_boards)} (unreachable {len(unreachable_boards)}"
+        f"{', outage' if outage else ''}; moved {moved_count}); "
+        f"aggregators {len(aggregator_results)}; "
         f"feeds {len(feed_results)} (failed {len(failed_feeds)}); "
         f"initialized {initialized_count}; recorded {len(new_jobs)} new matching jobs"
     )

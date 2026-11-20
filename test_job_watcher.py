@@ -1,7 +1,11 @@
 import sqlite3
+import socket
+import tempfile
 import unittest
+import urllib.error
 import json
 import time
+from pathlib import Path
 from unittest.mock import patch
 from datetime import datetime, timezone
 
@@ -27,6 +31,7 @@ from job_watcher import (
     select_due_boards,
     source_candidates,
 )
+import job_watcher
 
 
 class MatchTests(unittest.TestCase):
@@ -478,6 +483,219 @@ class MatchTests(unittest.TestCase):
         self.assertIn("Jobs inspected: 2", text)
         self.assertIn("excluded_seniority_or_internship: 1", text)
         connection.close()
+
+
+def http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://example.com", code, "error", None, None)
+
+
+DNS_ERROR = urllib.error.URLError(
+    socket.gaierror(8, "nodename nor servname provided, or not known")
+)
+
+
+class BoardHealthTests(unittest.TestCase):
+    def test_network_errors_are_not_board_errors(self):
+        for exc in (
+            DNS_ERROR,
+            socket.timeout("The read operation timed out"),
+            ConnectionResetError(54, "Connection reset by peer"),
+        ):
+            self.assertTrue(job_watcher.is_network_error(exc), exc)
+            self.assertFalse(job_watcher.is_missing_board_error(exc), exc)
+        self.assertFalse(job_watcher.is_network_error(http_error(404)))
+        self.assertTrue(job_watcher.is_missing_board_error(http_error(404)))
+        self.assertTrue(job_watcher.is_missing_board_error(http_error(410)))
+        self.assertFalse(job_watcher.is_missing_board_error(http_error(500)))
+        self.assertFalse(job_watcher.is_network_error(ValueError("bad json")))
+
+    def test_network_outage_rule(self):
+        self.assertFalse(job_watcher.network_outage(0, 0))
+        self.assertTrue(job_watcher.network_outage(0, 1))
+        self.assertTrue(job_watcher.network_outage(2, 3))
+        self.assertFalse(job_watcher.network_outage(20, 2))
+
+    def test_wait_for_network_retries_then_gives_up(self):
+        sleeps = []
+        with patch("job_watcher.network_available", side_effect=[False, False, True]):
+            self.assertTrue(job_watcher.wait_for_network(sleep=sleeps.append))
+        self.assertEqual(sleeps, [5, 5])
+
+        ticks = iter(range(0, 1000, 5))
+        with patch("job_watcher.network_available", return_value=False):
+            self.assertFalse(job_watcher.wait_for_network(
+                timeout=20, sleep=lambda _: None, clock=lambda: next(ticks),
+            ))
+
+    def test_unreachable_board_keeps_failure_count(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE board_stats (board_key TEXT PRIMARY KEY, last_checked INTEGER NOT NULL, "
+            "relevant_count INTEGER NOT NULL DEFAULT 0, match_count INTEGER NOT NULL DEFAULT 0, "
+            "failure_count INTEGER NOT NULL DEFAULT 0)"
+        )
+        connection.execute("INSERT INTO board_stats VALUES ('lever:flaky', 100, 0, 0, 2)")
+        job_watcher.record_board_unreachable(
+            connection, {"provider": "lever", "slug": "flaky"}, 500
+        )
+        job_watcher.record_board_unreachable(
+            connection, {"provider": "ashby", "slug": "fresh"}, 500
+        )
+        self.assertEqual(
+            sorted(connection.execute("SELECT * FROM board_stats")),
+            [("ashby:fresh", 500, 0, 0, 0), ("lever:flaky", 500, 0, 0, 2)],
+        )
+
+    def test_find_migrated_board_probes_other_providers(self):
+        calls = []
+
+        def fetch(url):
+            calls.append(url)
+            if "ashbyhq" in url:
+                return {"jobs": [{"title": "Engineer", "isListed": True}]}
+            raise http_error(404)
+
+        moved = job_watcher.find_migrated_board(
+            {"provider": "greenhouse", "slug": "benchling"}, fetch=fetch
+        )
+        self.assertEqual(moved, {
+            "provider": "ashby", "slug": "benchling",
+            "migrated_from": "greenhouse:benchling",
+        })
+        self.assertFalse(any("greenhouse" in url for url in calls))
+
+    def test_find_migrated_board_ignores_empty_and_unlisted_boards(self):
+        def fetch(url):
+            if "ashbyhq" in url:
+                return {"jobs": [{"title": "Engineer", "isListed": False}]}
+            if "lever" in url:
+                return []
+            raise http_error(404)
+
+        self.assertIsNone(job_watcher.find_migrated_board(
+            {"provider": "lever-eu", "slug": "gone"}, fetch=fetch
+        ))
+
+    def test_apply_board_migration_rewrites_registry_and_keeps_baseline(self):
+        directory = Path(tempfile.mkdtemp())
+        registry = directory / "ats_boards.json"
+        registry.write_text(json.dumps([
+            {"provider": "ashby", "slug": "first"},
+            {"provider": "greenhouse", "slug": "benchling"},
+            {"provider": "lever", "slug": "last"},
+        ]))
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE initialized_boards (board_key TEXT PRIMARY KEY)")
+        connection.execute(
+            "CREATE TABLE board_stats (board_key TEXT PRIMARY KEY, last_checked INTEGER, "
+            "relevant_count INTEGER, match_count INTEGER, failure_count INTEGER)"
+        )
+        connection.execute("INSERT INTO initialized_boards VALUES ('greenhouse:benchling')")
+        connection.execute("INSERT INTO board_stats VALUES ('greenhouse:benchling', 1, 0, 0, 3)")
+
+        job_watcher.apply_board_migration(
+            connection,
+            {"provider": "greenhouse", "slug": "benchling"},
+            {"provider": "ashby", "slug": "benchling", "migrated_from": "greenhouse:benchling"},
+            registry,
+        )
+
+        self.assertEqual(json.loads(registry.read_text()), [
+            {"provider": "ashby", "slug": "first"},
+            {"provider": "ashby", "slug": "benchling", "migrated_from": "greenhouse:benchling"},
+            {"provider": "lever", "slug": "last"},
+        ])
+        self.assertEqual(list(directory.glob(".*.tmp")), [])
+        self.assertIsNotNone(connection.execute(
+            "SELECT 1 FROM initialized_boards WHERE board_key = 'ashby:benchling'"
+        ).fetchone())
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM board_stats").fetchone(), (0,))
+
+
+class MainRunTests(unittest.TestCase):
+    def run_main(self, boards, fetch_board, fetch_json=None):
+        directory = Path(tempfile.mkdtemp())
+        registry = directory / "ats_boards.json"
+        registry.write_text(json.dumps(boards))
+        patches = [
+            patch("job_watcher.STATE_DIR", directory),
+            patch("job_watcher.DB_PATH", directory / "jobs.sqlite3"),
+            patch("job_watcher.BOARDS_PATH", registry),
+            patch("job_watcher.load_feeds", return_value=[]),
+            patch("job_watcher.wait_for_network", return_value=True),
+            patch("job_watcher.fetch_direct_board", side_effect=fetch_board),
+            patch("job_watcher.send_email"),
+            patch("job_watcher.send_health_report_if_due"),
+            patch("job_watcher.sys.argv", ["job_watcher.py"]),
+        ]
+        if fetch_json is not None:
+            patches.append(patch("job_watcher.fetch_json", side_effect=fetch_json))
+        aggregators = patch("job_watcher.fetch_due_aggregators", return_value=[])
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        self.aggregators = aggregators.start()
+        self.addCleanup(aggregators.stop)
+        self.assertEqual(job_watcher.main(), 0)
+        connection = sqlite3.connect(directory / "jobs.sqlite3")
+        self.addCleanup(connection.close)
+        stats = {
+            row[0]: row[1:]
+            for row in connection.execute(
+                "SELECT board_key, last_checked, failure_count FROM board_stats"
+            )
+        }
+        return stats, json.loads(registry.read_text())
+
+    def test_offline_batch_leaves_boards_due_and_skips_aggregators(self):
+        def fetch_board(board):
+            raise DNS_ERROR
+
+        stats, _ = self.run_main(
+            [{"provider": "greenhouse", "slug": f"company-{n}"} for n in range(5)],
+            fetch_board,
+        )
+        self.assertEqual(stats, {})
+        self.aggregators.assert_not_called()
+
+    def test_mixed_batch_moves_404_boards_and_spares_flaky_ones(self):
+        def fetch_board(board):
+            if board["slug"] == "benchling":
+                raise http_error(404)
+            if board["slug"] == "dead":
+                raise http_error(404)
+            if board["slug"] == "slow":
+                raise socket.timeout("The read operation timed out")
+            if board["slug"] == "broken":
+                raise http_error(500)
+            return board, []
+
+        def fetch_json(url):
+            if "ashbyhq" in url and "/benchling" in url:
+                return {"jobs": [{"title": "Engineer"}]}
+            raise http_error(404)
+
+        boards = [
+            {"provider": "greenhouse", "slug": "benchling"},
+            {"provider": "greenhouse", "slug": "dead"},
+            {"provider": "greenhouse", "slug": "slow"},
+            {"provider": "greenhouse", "slug": "broken"},
+            *({"provider": "lever", "slug": f"ok-{n}"} for n in range(4)),
+        ]
+        stats, registry = self.run_main(boards, fetch_board, fetch_json)
+
+        self.assertEqual(stats["greenhouse:dead"][1], 1)
+        self.assertEqual(stats["greenhouse:broken"][1], 1)
+        self.assertEqual(stats["greenhouse:slow"][1], 0)
+        self.assertNotIn("greenhouse:benchling", stats)
+        self.assertIn(
+            {"provider": "ashby", "slug": "benchling", "migrated_from": "greenhouse:benchling"},
+            registry,
+        )
+        self.assertNotIn({"provider": "greenhouse", "slug": "benchling"}, registry)
+        self.aggregators.assert_called_once()
 
 
 if __name__ == "__main__":

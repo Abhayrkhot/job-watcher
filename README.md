@@ -7,12 +7,27 @@ missed runs are visible in the logs.
 
 The watcher polls a reviewed registry of employer career boards through public
 Greenhouse, Lever, Ashby, SmartRecruiters, Recruitee, and Workable APIs. Each run
-checks up
-to 200 due boards. Boards with several relevant roles or a citizenship-safe match
-run every five minutes, boards with some relevant roles run every 30 minutes, and
-quiet boards run every two hours. Failed boards retry after five minutes with
-bounded exponential backoff up to 24 hours, keeping dead boards from consuming
-the active polling budget. A board's first successful poll creates a silent
+checks up to 200 due boards. Boards with a current match run every 30 minutes,
+boards with three or more relevant roles every hour, boards with some relevant
+roles every three hours, and quiet boards every 12 hours. Boards that answer with
+an HTTP error retry after 5 and then 10 minutes, and after a third failure wait a
+week, keeping dead boards from consuming the active polling budget.
+
+Network errors are not counted against a board. launchd starts a missed run as
+soon as the Mac wakes, often before DNS is back, so each run first waits up to 60
+seconds for DNS. If network errors still outnumber successful fetches, the run is
+treated as an outage: the affected boards stay due and aggregators and feeds are
+skipped so they keep their polling slot. A lone timeout or reset counts as a check
+that found nothing.
+
+Companies often keep their slug when they switch ATS. When a board returns 404 or
+410, the same slug is probed on the public Greenhouse, Ashby, and Lever APIs. If
+it has listed jobs there, `state/ats_boards.json` is rewritten to point at the new
+provider, with a `migrated_from` field recording the old key. The move is logged
+as `Board moved:` in `state/watcher.log`. Because a slug can belong to a different
+company with the same name, review those lines occasionally.
+
+A board's first successful poll creates a silent
 baseline; only later matching postings are mailed. Jobs must have a detectable
 posted timestamp within the last 24 hours to be eligible.
 
