@@ -57,11 +57,28 @@ conditional GET, as a backstop source for roles on systems the watcher can't rea
 (iCIMS, custom career sites). A role found both directly and through Simplify is
 mailed once.
 
-Each run checks up to 200 due boards. Boards with a current match run every 30 minutes,
-boards with three or more relevant roles every hour, boards with some relevant
-roles every three hours, and quiet boards every 12 hours. Boards that answer with
-an HTTP error retry after 5 and then 10 minutes, and after a third failure wait a
-week, keeping dead boards from consuming the active polling budget.
+## Speed
+
+The point is to see a role minutes after it's posted, so polling has to be cheap
+enough to run constantly:
+
+- Boards with roles in our area are polled on every run (two minutes apart on the
+  box), and all other boards every 10 minutes.
+- Every list request sends gzip and `If-None-Match`. Greenhouse, Lever, Ashby, and
+  Workable answer 304 when nothing changed, so an unchanged board costs one tiny
+  response. A board's ETag is saved only after all of its new jobs are processed.
+- Greenhouse is read without descriptions (21 KB gzipped instead of about 1.4 MB
+  for a large board). The full posting is fetched only for new job IDs, and the
+  posting time comes from `first_published`, so an edit doesn't make an old job
+  look new.
+- With `JOB_WATCHER_NTFY_TOPIC` set, each new match is pushed to your phone through
+  ntfy before the email goes out. The alert opens the apply link. Pick an
+  unguessable topic name, since ntfy.sh topics are public to anyone who knows them.
+  `./run.sh --test-push` sends a test alert.
+
+Each run checks up to 2000 due boards. Boards that answer with an HTTP error retry
+after 5 and then 10 minutes, and after a third failure wait a week, keeping dead
+boards from consuming the active polling budget.
 
 Network errors are not counted against a board. launchd starts a missed run as
 soon as the Mac wakes, often before DNS is back, so each run first waits up to 60
@@ -116,10 +133,23 @@ The installer writes a local LaunchAgent plist to `~/Library/LaunchAgents` and
 starts it immediately. The first run records existing jobs without emailing them.
 Later runs send only new matches. Logs are under `state/`.
 
-## Local Scheduling
+## Scheduling
 
-`setup.sh` installs a LaunchAgent that runs every five minutes. That is now the
-source of truth for polling, so the watcher does not depend on GitHub Actions.
+Run the watcher on a machine that never sleeps. A laptop that sleeps misses the
+first hours of every posting it sleeps through.
+
+**Linux (systemd, recommended):** the units in `deploy/systemd` run one poll at a
+time, two minutes after the previous poll finishes:
+
+```bash
+mkdir -p ~/.config/systemd/user
+sed "s|__PROJECT_DIR__|$PWD|g" deploy/systemd/job-watcher.service.in > ~/.config/systemd/user/job-watcher.service
+cp deploy/systemd/job-watcher.timer ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now job-watcher.timer
+loginctl enable-linger "$USER"   # keep running when you are logged out
+```
+
+**macOS:** `setup.sh` installs a LaunchAgent that runs every five minutes.
 
 Optional approved aggregator secrets can still be added locally through `.env`:
 

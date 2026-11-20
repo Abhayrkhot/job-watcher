@@ -1,0 +1,13 @@
+[Unit]
+Description=New-grad job watcher (one poll)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__PROJECT_DIR__
+ExecStart=/usr/bin/env bash __PROJECT_DIR__/run.sh
+StandardOutput=append:__PROJECT_DIR__/state/watcher.log
+StandardError=append:__PROJECT_DIR__/state/watcher-error.log
+TimeoutStartSec=20min
+Nice=5

@@ -347,12 +347,13 @@ class MatchTests(unittest.TestCase):
                 ("greenhouse:quiet", 900, 0, 0),
             ],
         )
+        # Boards with relevant roles are polled every 2 minutes, quiet ones every 10.
         selected = select_due_boards(connection, boards, now=1000)
         self.assertEqual(
-            {board["slug"] for board in selected}, {"new"}
+            {board["slug"] for board in selected}, {"new", "high", "medium"}
         )
 
-    def test_board_batch_is_capped_at_200(self):
+    def test_board_batch_is_capped(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         connection.execute(
@@ -361,9 +362,9 @@ class MatchTests(unittest.TestCase):
         )
         boards = [
             {"provider": "greenhouse", "slug": f"company-{index}"}
-            for index in range(250)
+            for index in range(2500)
         ]
-        self.assertEqual(len(select_due_boards(connection, boards, now=1000)), 200)
+        self.assertEqual(len(select_due_boards(connection, boards, now=1000)), 2000)
 
     def test_failed_boards_retry_with_bounded_backoff(self):
         self.assertEqual(failure_retry_seconds(1), 5 * 60)
@@ -745,6 +746,7 @@ class MainRunTests(unittest.TestCase):
             patch("job_watcher.wait_for_network", return_value=True),
             patch("job_watcher.fetch_direct_board", side_effect=fetch_board),
             patch("job_watcher.send_email"),
+            patch("job_watcher.send_push"),
             patch("job_watcher.send_health_report_if_due"),
             patch("job_watcher.fetch_simplify", return_value=[]),
             patch("job_watcher.sys.argv", ["job_watcher.py"]),
@@ -767,6 +769,14 @@ class MainRunTests(unittest.TestCase):
             )
         }
         return stats, json.loads(registry.read_text())
+
+    def test_unchanged_board_is_marked_checked_without_jobs(self):
+        def fetch_board(board):
+            board["_not_modified"] = True
+            return board, []
+
+        stats, _ = self.run_main([{"provider": "lever", "slug": "acme"}], fetch_board)
+        self.assertEqual(stats["lever:acme"][1], 0)
 
     def test_workday_baseline_then_new_job_is_emailed(self):
         board = {"provider": "workday", "slug": "acme.wd5.myworkdayjobs.com/acme/Careers", "company": "Acme"}
@@ -794,6 +804,7 @@ class MainRunTests(unittest.TestCase):
                     patch("job_watcher.fetch_simplify", return_value=[]), \
                     patch("job_watcher.send_health_report_if_due"), \
                     patch("job_watcher.sys.argv", ["job_watcher.py"]), \
+                    patch("job_watcher.send_push"), \
                     patch("job_watcher.send_email") as send_email:
                 job_watcher.main()                      # first poll: baseline
                 self.assertEqual(detail_calls, [])
@@ -971,6 +982,94 @@ class CareerSiteTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["company_name"], "Acme")
         self.assertTrue(matches(jobs[0]))
+
+
+class ConditionalFetchTests(unittest.TestCase):
+    class Response:
+        def __init__(self, body, headers):
+            self.body, self.headers = body, headers
+        def read(self): return self.body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def test_fetch_json_gzip_etag_and_304(self):
+        import gzip
+        board = {"provider": "greenhouse", "slug": "acme"}
+        response = self.Response(gzip.compress(b'{"jobs": []}'), {"Content-Encoding": "gzip", "ETag": '"e1"'})
+        with patch("job_watcher.urllib.request.urlopen", return_value=response):
+            self.assertEqual(job_watcher.fetch_json("https://x/jobs", board=board), {"jobs": []})
+        self.assertEqual(board["_new_etag"], '"e1"')
+        board["_etag"] = '"e1"'
+        sent = []
+
+        def not_modified(request, timeout):
+            sent.append(request.get_header("If-none-match"))
+            raise urllib.error.HTTPError("https://x/jobs", 304, "Not Modified", None, None)
+
+        with patch("job_watcher.urllib.request.urlopen", side_effect=not_modified):
+            board_out, jobs = job_watcher.fetch_direct_board(board)
+        self.assertEqual((jobs, board_out["_not_modified"], sent), ([], True, ['"e1"']))
+
+    def test_greenhouse_lists_then_fetches_new_recent_jobs(self):
+        now = int(time.time())
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 1800))
+        old = "2020-01-01T00:00:00Z"
+        board = {"provider": "greenhouse", "slug": "acme", "_known_ids": frozenset({"3"})}
+        listing = {"jobs": [
+            {"id": 1, "title": "Software Engineer, New Grad", "first_published": recent,
+             "updated_at": recent, "company_name": "Acme Robotics", "location": {"name": "Boston, MA"}},
+            {"id": 2, "title": "Software Engineer", "first_published": old, "updated_at": recent},
+            {"id": 3, "title": "Data Engineer", "first_published": recent},
+        ]}
+
+        def fetch(url, data=None, board=None):
+            if url.endswith("/jobs"):
+                return listing
+            self.assertTrue(url.endswith("/jobs/1"))
+            return {"title": "Software Engineer, New Grad", "content": "&lt;p&gt;Build&lt;/p&gt;",
+                    "absolute_url": "https://acme.com/careers?gh_jid=1", "location": {"name": "Boston, MA"}}
+
+        with patch("job_watcher.fetch_json", side_effect=fetch):
+            jobs = job_watcher.fetch_greenhouse_board(board, now)
+        self.assertEqual([job["company_name"] for job in jobs], ["Acme Robotics"])
+        self.assertEqual(jobs[0]["description"], "Build")
+        self.assertEqual(job_watcher.job_posted_timestamp(jobs[0]), now - 1800)
+        self.assertEqual(sorted(board["_listed_ids"]), ["1", "2", "3"])
+
+    def test_etag_is_dropped_while_new_ids_are_unprocessed(self):
+        board = {"provider": "bamboohr", "slug": "acme", "_new_etag": '"e2"'}
+        plan = job_watcher.DetailPlan(board)
+        for index in range(job_watcher.MAX_DETAIL_FETCHES_PER_BOARD + 3):
+            plan.consider(index, "Software Engineer")
+        plan.details(lambda job_id, payload: None)
+        self.assertNotIn("_new_etag", board)
+        self.assertEqual(len(board["_listed_ids"]), job_watcher.MAX_DETAIL_FETCHES_PER_BOARD)
+
+
+class PushTests(unittest.TestCase):
+    def test_push_sends_newest_first_and_summarizes_overflow(self):
+        now = int(time.time())
+        jobs = [{"title": f"Software Engineer {n}", "company_name": "Acme", "locations": ["Austin, TX"],
+                 "url": f"https://x/{n}", "posted_at": now - n * 60} for n in range(7)]
+        sent = []
+
+        def capture(request, timeout):
+            sent.append(json.loads(request.data))
+            return ConditionalFetchTests.Response(b"", {})
+
+        with patch.dict("os.environ", {"JOB_WATCHER_NTFY_TOPIC": "secret-topic"}), \
+                patch("job_watcher.urllib.request.urlopen", side_effect=capture):
+            job_watcher.send_push(jobs)
+        self.assertEqual(len(sent), 6)
+        self.assertEqual(sent[0]["click"], "https://x/0")
+        self.assertEqual(sent[0]["topic"], "secret-topic")
+        self.assertEqual(sent[-1]["title"], "+2 more new roles")
+
+    def test_push_is_off_without_a_topic(self):
+        with patch.dict("os.environ", {}, clear=True), \
+                patch("job_watcher.urllib.request.urlopen") as urlopen:
+            job_watcher.send_push([{"title": "x"}])
+        urlopen.assert_not_called()
 
 
 class DiscoveryTests(unittest.TestCase):

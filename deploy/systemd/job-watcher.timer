@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the job watcher two minutes after each poll finishes
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

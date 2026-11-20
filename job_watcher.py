@@ -34,7 +34,9 @@ BOARDS_PATH = STATE_DIR / "ats_boards.json"
 FEEDS_PATH = STATE_DIR / "feeds.json"
 BOOTSTRAP_BOARDS_PATH = BASE_DIR / "bootstrap" / "ats_boards.json"
 BOOTSTRAP_FEEDS_PATH = BASE_DIR / "bootstrap" / "feeds.json"
-ATS_BATCH_SIZE = 200
+ATS_BATCH_SIZE = 2000
+HOT_POLL_SECONDS = 2 * 60
+BASE_POLL_SECONDS = 10 * 60
 # launchd starts a missed run the moment the Mac wakes, often before DNS is back.
 NETWORK_WAIT_SECONDS = 60
 NETWORK_RETRY_SECONDS = 5
@@ -490,6 +492,9 @@ def connect_db() -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS http_cache (url TEXT PRIMARY KEY, etag TEXT)"
     )
     connection.execute(
+        "CREATE TABLE IF NOT EXISTS board_etags (board_key TEXT PRIMARY KEY, etag TEXT)"
+    )
+    connection.execute(
         "CREATE TABLE IF NOT EXISTS observed_source_jobs ("
         "source TEXT NOT NULL, job_id TEXT NOT NULL, "
         "first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
@@ -551,13 +556,11 @@ def load_feeds() -> list[dict]:
 
 
 def board_interval_seconds(relevant_count: int, match_count: int) -> int:
-    if match_count > 0:
-        return 30 * 60
-    if relevant_count >= 3:
-        return 60 * 60
-    if relevant_count > 0:
-        return 3 * 60 * 60
-    return 12 * 60 * 60
+    # Unchanged boards answer 304 (or a tiny Workday page), so polling is cheap;
+    # boards with roles in our area are checked on every run.
+    if match_count > 0 or relevant_count > 0:
+        return HOT_POLL_SECONDS
+    return BASE_POLL_SECONDS
 
 
 def failure_retry_seconds(failure_count: int) -> int:
@@ -865,49 +868,59 @@ def direct_job(
     }
 
 
-def fetch_json(url: str, data: bytes | None = None) -> object:
+class NotModified(Exception):
+    """The board's list endpoint answered 304: nothing changed since the last poll."""
+
+
+def fetch_json(url: str, data: bytes | None = None, board: dict | None = None) -> object:
+    """GET (or POST) JSON with gzip. With a board, send its ETag and remember the new one."""
     headers = {
         "Accept": "application/json",
+        "Accept-Encoding": "gzip",
         "User-Agent": "personal-new-grad-job-watcher/1.0",
     }
     if data is not None:
         headers["Content-Type"] = "application/json"
+    etag = board.get("_etag") if board is not None else None
+    if etag:
+        headers["If-None-Match"] = etag
     request = urllib.request.Request(
         url,
         data=data,
         headers=headers,
         method="POST" if data is not None else "GET",
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read()
+            if response.headers.get("Content-Encoding") == "gzip":
+                body = gzip.decompress(body)
+            if board is not None and response.headers.get("ETag"):
+                board["_new_etag"] = response.headers["ETag"]
+            return json.loads(body)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304 and etag:
+            raise NotModified(url) from None
+        raise
 
 
 def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
+    try:
+        return board, read_board(board)
+    except NotModified:
+        board["_not_modified"] = True
+        return board, []
+
+
+def read_board(board: dict) -> list[dict]:
     provider = board["provider"]
     if provider in CAREER_SITE_FETCHERS:
-        return board, CAREER_SITE_FETCHERS[provider](board, int(time.time()))
+        return CAREER_SITE_FETCHERS[provider](board, int(time.time()))
     slug = urllib.parse.quote(board["slug"], safe="")
     normalized = []
-    if provider == "greenhouse":
-        payload = fetch_json(
-            f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
-        )
-        for item in payload.get("jobs", []):
-            posted_at = item.get("updated_at") or item.get("created_at")
-            if not source_timestamp_is_recent(posted_at):
-                continue
-            normalized.append(direct_job(
-                board,
-                item.get("id"),
-                str(item.get("title", "")),
-                [str((item.get("location") or {}).get("name", ""))],
-                str(item.get("absolute_url", "")),
-                plain_text(str(item.get("content", ""))),
-                posted_at,
-            ))
-    elif provider in {"lever", "lever-eu"}:
+    if provider in {"lever", "lever-eu"}:
         domain = "api.eu.lever.co" if provider == "lever-eu" else "api.lever.co"
-        payload = fetch_json(f"https://{domain}/v0/postings/{slug}?mode=json")
+        payload = fetch_json(f"https://{domain}/v0/postings/{slug}?mode=json", board=board)
         for item in payload:
             posted_at = item.get("createdAt") or item.get("created_at") or item.get("updatedAt")
             if not source_timestamp_is_recent(posted_at):
@@ -931,7 +944,7 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                 posted_at,
             ))
     elif provider == "ashby":
-        payload = fetch_json(f"https://api.ashbyhq.com/posting-api/job-board/{slug}")
+        payload = fetch_json(f"https://api.ashbyhq.com/posting-api/job-board/{slug}", board=board)
         for item in payload.get("jobs", []):
             if not item.get("isListed", True):
                 continue
@@ -961,60 +974,6 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                 str(item.get("descriptionPlain", "")),
                 posted_at,
             ))
-    elif provider == "smartrecruiters":
-        offset = 0
-        while offset < 300:
-            payload = fetch_json(
-                "https://api.smartrecruiters.com/v1/companies/"
-                f"{slug}/postings?limit=100&offset={offset}&country=us"
-            )
-            items = payload.get("content", [])
-            for item in items:
-                posted_at = (
-                    item.get("releasedDate")
-                    or item.get("releaseDate")
-                    or item.get("createdOn")
-                )
-                if not source_timestamp_is_recent(posted_at):
-                    continue
-                title = str(item.get("name", ""))
-                lowered_title = title.lower()
-                if title_rejection(title):
-                    continue
-                posting_id = str(item.get("id", ""))
-                detail = fetch_json(
-                    "https://api.smartrecruiters.com/v1/companies/"
-                    f"{slug}/postings/{urllib.parse.quote(posting_id, safe='')}"
-                )
-                sections = ((detail.get("jobAd") or {}).get("sections") or {}).values()
-                experience = str((detail.get("experienceLevel") or {}).get("label", ""))
-                description = " ".join(
-                    [experience, *[plain_text(str(section.get("text", ""))) for section in sections]]
-                )
-                location = detail.get("location") or item.get("location") or {}
-                locations = [str(location.get("fullLocation", ""))]
-                if str(location.get("country", "")).lower() == "us":
-                    locations.append("United States")
-                job = direct_job(
-                    board,
-                    detail.get("id") or posting_id,
-                    str(detail.get("name") or title),
-                    locations,
-                    str(detail.get("applyUrl") or f"https://jobs.smartrecruiters.com/{slug}/{posting_id}"),
-                    description,
-                    detail.get("releasedDate")
-                    or detail.get("releaseDate")
-                    or detail.get("createdOn")
-                    or posted_at,
-                )
-                job["company_name"] = str(
-                    (detail.get("company") or item.get("company") or {}).get("name")
-                    or company_from_slug(board["slug"])
-                )
-                normalized.append(job)
-            offset += len(items)
-            if not items or offset >= int(payload.get("totalFound", 0)):
-                break
     elif provider == "recruitee":
         payload = fetch_json(f"https://{slug}.recruitee.com/api/offers/")
         items = payload.get("offers", payload if isinstance(payload, list) else [])
@@ -1040,7 +999,7 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
             ))
     elif provider == "workable":
         payload = fetch_json(
-            f"https://www.workable.com/api/accounts/{slug}?details=true"
+            f"https://www.workable.com/api/accounts/{slug}?details=true", board=board
         )
         for item in payload.get("jobs", []):
             locations = []
@@ -1076,7 +1035,7 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
             )
             job["company_name"] = str(payload.get("name") or company_from_slug(board["slug"]))
             normalized.append(job)
-    return board, normalized
+    return normalized
 
 
 # --- Career-site readers ----------------------------------------------------------
@@ -1087,7 +1046,9 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
 # a board just records the IDs that exist (the silent baseline) without fetching any
 # details.
 
-DETAIL_PROVIDERS = {"workday", "oracle", "bamboohr", "rippling", "jobvite"}
+DETAIL_PROVIDERS = {
+    "greenhouse", "smartrecruiters", "workday", "oracle", "bamboohr", "rippling", "jobvite",
+}
 MAX_DETAIL_FETCHES_PER_BOARD = 25
 WORKDAY_PAGE_SIZE = 20
 WORKDAY_MAX_PAGES = 5
@@ -1156,6 +1117,9 @@ class DetailPlan:
             if job:
                 jobs.append(job)
         self.board["_listed_ids"] = self.handled
+        unprocessed = {job_id for job_id, _ in self.fresh} - set(self.handled)
+        if unprocessed:
+            self.board.pop("_new_etag", None)  # poll the full list again next run
         return jobs
 
 
@@ -1355,7 +1319,73 @@ def fetch_jazzhr_board(board: dict, now: int) -> list[dict]:
     return jobs
 
 
+def fetch_greenhouse_board(board: dict, now: int) -> list[dict]:
+    base = f'https://boards-api.greenhouse.io/v1/boards/{urllib.parse.quote(str(board["slug"]), safe="")}/jobs'
+    payload = fetch_json(base, board=board)
+    plan = DetailPlan(board)
+    for item in payload.get("jobs") or []:
+        published = parse_job_datetime(item.get("first_published") or item.get("updated_at"))
+        plan.consider(item.get("id"), item.get("title"),
+                      published is not None and now - published <= MAX_JOB_AGE_SECONDS, item)
+
+    def one(job_id, item):
+        detail = fetch_json(f"{base}/{job_id}") or {}
+        job = direct_job(
+            board, job_id, str(detail.get("title") or item.get("title") or ""),
+            [str((detail.get("location") or item.get("location") or {}).get("name", ""))],
+            str(detail.get("absolute_url") or item.get("absolute_url") or ""),
+            plain_text(str(detail.get("content") or "")),
+            item.get("first_published") or detail.get("first_published") or item.get("updated_at"),
+        )
+        if item.get("company_name") and not board.get("company"):
+            job["company_name"] = str(item["company_name"])
+        return job
+
+    return plan.details(one)
+
+
+def fetch_smartrecruiters_board(board: dict, now: int) -> list[dict]:
+    slug = urllib.parse.quote(str(board["slug"]), safe="")
+    api = f"https://api.smartrecruiters.com/v1/companies/{slug}/postings"
+    plan = DetailPlan(board)
+    offset = 0
+    while offset < 300:
+        payload = fetch_json(f"{api}?limit=100&offset={offset}&country=us")
+        items = payload.get("content") or []
+        for item in items:
+            posted = item.get("releasedDate") or item.get("releaseDate") or item.get("createdOn")
+            plan.consider(item.get("id"), item.get("name"), source_timestamp_is_recent(posted, now), item)
+        offset += len(items)
+        if not items or plan.baseline or offset >= int(payload.get("totalFound") or 0):
+            break
+
+    def one(job_id, item):
+        detail = fetch_json(f"{api}/{urllib.parse.quote(job_id, safe='')}") or {}
+        sections = ((detail.get("jobAd") or {}).get("sections") or {}).values()
+        experience = str((detail.get("experienceLevel") or {}).get("label", ""))
+        location = detail.get("location") or item.get("location") or {}
+        locations = [str(location.get("fullLocation", ""))]
+        if str(location.get("country", "")).lower() == "us":
+            locations.append("United States")
+        job = direct_job(
+            board, detail.get("id") or job_id, str(detail.get("name") or item.get("name") or ""),
+            locations,
+            str(detail.get("applyUrl") or f"https://jobs.smartrecruiters.com/{slug}/{job_id}"),
+            " ".join([experience, *[plain_text(str(section.get("text", ""))) for section in sections]]),
+            detail.get("releasedDate") or detail.get("releaseDate") or detail.get("createdOn")
+            or item.get("releasedDate") or item.get("createdOn"),
+        )
+        job["company_name"] = str(
+            (detail.get("company") or item.get("company") or {}).get("name") or board_company(board)
+        )
+        return job
+
+    return plan.details(one)
+
+
 CAREER_SITE_FETCHERS = {
+    "greenhouse": fetch_greenhouse_board,
+    "smartrecruiters": fetch_smartrecruiters_board,
     "workday": fetch_workday_board,
     "oracle": fetch_oracle_board,
     "bamboohr": fetch_bamboohr_board,
@@ -1365,20 +1395,39 @@ CAREER_SITE_FETCHERS = {
 }
 
 
-def prepare_detail_boards(connection: sqlite3.Connection, boards: list[dict]) -> list[dict]:
-    """Attach known job IDs and baseline status to boards read through DetailPlan."""
+def prepare_boards(connection: sqlite3.Connection, boards: list[dict]) -> list[dict]:
+    """Attach ETags, and known job IDs plus baseline status for DetailPlan readers."""
     initialized = {row[0] for row in connection.execute("SELECT board_key FROM initialized_boards")}
+    etags = dict(connection.execute("SELECT board_key, etag FROM board_etags"))
     prepared = []
     for board in boards:
-        if board.get("provider") not in DETAIL_PROVIDERS:
-            prepared.append(board)
-            continue
         key = f'{board["provider"]}:{board["slug"]}'
-        known = frozenset(row[0] for row in connection.execute(
-            "SELECT job_id FROM observed_source_jobs WHERE source = ?", (key,)
-        ))
-        prepared.append({**board, "_known_ids": known, "_baseline": key not in initialized})
+        extra = {"_etag": etags.get(key)} if etags.get(key) and key in initialized else {}
+        if board.get("provider") in DETAIL_PROVIDERS:
+            extra["_known_ids"] = frozenset(row[0] for row in connection.execute(
+                "SELECT job_id FROM observed_source_jobs WHERE source = ?", (key,)
+            ))
+            extra["_baseline"] = key not in initialized
+        prepared.append({**board, **extra} if extra else board)
     return prepared
+
+
+def record_board_checked(connection: sqlite3.Connection, board: dict, checked_at: int) -> None:
+    """A 304: the board answered and nothing changed, so keep its counts."""
+    connection.execute(
+        "INSERT INTO board_stats(board_key, last_checked) VALUES (?, ?) "
+        "ON CONFLICT(board_key) DO UPDATE SET last_checked=excluded.last_checked, failure_count=0",
+        (f'{board["provider"]}:{board["slug"]}', checked_at),
+    )
+
+
+def remember_etag(connection: sqlite3.Connection, board: dict) -> None:
+    if board.get("_new_etag"):
+        connection.execute(
+            "INSERT INTO board_etags(board_key, etag) VALUES (?, ?) "
+            "ON CONFLICT(board_key) DO UPDATE SET etag=excluded.etag",
+            (f'{board["provider"]}:{board["slug"]}', board["_new_etag"]),
+        )
 
 
 def remember_listed_ids(connection: sqlite3.Connection, board: dict) -> None:
@@ -1958,6 +2007,47 @@ def deliver_email(subject: str, text_body: str, html_body: str, idempotency_key:
         smtp.login(sender, password.replace(" ", ""))
         smtp.send_message(message)
 
+
+
+PUSH_MAX_PER_RUN = 5
+
+
+def send_push(jobs: list[dict]) -> None:
+    """Phone alerts through ntfy, sent before the email so you can apply first."""
+    topic = os.environ.get("JOB_WATCHER_NTFY_TOPIC")
+    if not topic or not jobs:
+        return
+    server = os.environ.get("JOB_WATCHER_NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+    ordered = sorted(jobs, key=lambda job: -(job_posted_timestamp(job) or 0))
+    messages = [{
+        "topic": topic,
+        "title": f'{display_company_name(job.get("company_name"))}: {job.get("title", "")}'[:250],
+        "message": " · ".join(filter(None, [
+            ", ".join(str(value) for value in (job.get("locations") or [])[:2]),
+            relative_posted_time(job),
+            experience_summary(job),
+        ])),
+        "click": str(job.get("url") or ""),
+        "tags": ["briefcase"],
+        "priority": 4,
+    } for job in ordered[:PUSH_MAX_PER_RUN]]
+    if len(jobs) > PUSH_MAX_PER_RUN:
+        messages.append({
+            "topic": topic,
+            "title": f"+{len(jobs) - PUSH_MAX_PER_RUN} more new roles",
+            "message": "The email has the full list.",
+            "priority": 3,
+        })
+    for message in messages:
+        request = urllib.request.Request(
+            server, data=json.dumps(message).encode(), method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": "personal-new-grad-job-watcher/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10):
+                pass
+        except Exception as exc:
+            print(f"Push notification failed: {exc}", file=sys.stderr)
 
 
 def display_company_name(value: object) -> str:
@@ -2635,6 +2725,18 @@ def send_digest(connection: sqlite3.Connection, boards: list[dict], feeds: list[
 
 
 def main() -> int:
+    if "--test-push" in sys.argv:
+        send_push([{
+            "id": f"push-test-{time.time_ns()}",
+            "title": "Push test: you will get alerts like this",
+            "company_name": "Job Watcher",
+            "locations": ["United States"],
+            "url": "https://github.com/Abhayrkhot/job-watcher",
+            "posted_at": int(time.time()),
+        }])
+        print("Push notification sent" if os.environ.get("JOB_WATCHER_NTFY_TOPIC")
+              else "JOB_WATCHER_NTFY_TOPIC is not set")
+        return 0
     if "--test-email" in sys.argv:
         send_email([{
             "id": f"delivery-test-{time.time_ns()}",
@@ -2672,7 +2774,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 0
-        due_boards = prepare_detail_boards(
+        due_boards = prepare_boards(
             connection, select_due_boards(connection, boards, checked_at)
         )
         direct_results, failed_boards = fetch_direct_batch(due_boards)
@@ -2705,7 +2807,12 @@ def main() -> int:
         metric_failures = Counter(
             f'ats:{board["provider"]}' for board, _ in failed_boards
         )
+        not_modified = 0
         for board, direct_jobs in direct_results:
+            if board.get("_not_modified"):
+                record_board_checked(connection, board, checked_at)
+                not_modified += 1
+                continue
             board_key = f'{board["provider"]}:{board["slug"]}'
             metric_jobs.setdefault(f'ats:{board["provider"]}', []).extend(direct_jobs)
             relevant_count = sum(1 for job in direct_jobs if potential_match(job))
@@ -2714,6 +2821,7 @@ def main() -> int:
                 connection, board, relevant_count, match_count, checked_at
             )
             remember_listed_ids(connection, board)
+            remember_etag(connection, board)
             new_candidates, was_initialized = source_candidates(
                 connection, board_key, direct_jobs
             )
@@ -2757,6 +2865,7 @@ def main() -> int:
                 candidate_keys.add(key)
                 new_jobs.append(job)
         if new_jobs and "--initialize" not in sys.argv:
+            send_push(new_jobs)
             send_email(new_jobs)
         record_jobs(connection, new_jobs)
         for source, jobs in metric_jobs.items():
@@ -2787,7 +2896,8 @@ def main() -> int:
             except Exception as exc:
                 print(f"Health report failed: {exc}", file=sys.stderr)
     print(
-        f"Selected {len(due_boards)} ATS boards; checked {len(direct_results)}; "
+        f"Selected {len(due_boards)} ATS boards; checked {len(direct_results)} "
+        f"({not_modified} unchanged); "
         f"failed {len(failed_boards)} (unreachable {len(unreachable_boards)}"
         f"{', outage' if outage else ''}; moved {moved_count}); "
         f"aggregators {len(aggregator_results)}; "
