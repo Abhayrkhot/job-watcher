@@ -56,7 +56,8 @@ class MatchTests(unittest.TestCase):
         self.assertTrue(matches(self.job("Software Engineer - New Grad", locations=["Remote in USA"])))
         self.assertFalse(matches(self.job("Software Engineer - New Grad", locations=["Toronto, ON, Canada"])))
         self.assertFalse(matches(self.job("Software Engineer - New Grad", locations=["Remote in Canada"])))
-        self.assertFalse(matches(self.job("Software Engineer - New Grad", locations=["New York, NY", "Toronto, ON, Canada"])))
+        # A role open in both countries is still a US role.
+        self.assertTrue(matches(self.job("Software Engineer - New Grad", locations=["New York, NY", "Toronto, ON, Canada"])))
 
     @patch("job_watcher.time.time", return_value=100000)
     def test_requires_recent_posting(self, _time_mock):
@@ -128,7 +129,7 @@ class MatchTests(unittest.TestCase):
         )
         self.assertEqual(
             rejection_reason(self.job("Software Engineer", description="Five years required.")),
-            "missing_entry_level_evidence",
+            "too_much_experience",
         )
         self.assertEqual(
             rejection_reason(self.job(
@@ -483,6 +484,121 @@ class MatchTests(unittest.TestCase):
         self.assertIn("Jobs inspected: 2", text)
         self.assertIn("excluded_seniority_or_internship: 1", text)
         connection.close()
+
+
+class FilterRecallTests(unittest.TestCase):
+    """Cases from the 2026-11 audit against a curated new-grad list."""
+
+    def job(self, title, description="General responsibilities.", locations=None, company="Acme"):
+        return {"title": title, "description": description, "company_name": company,
+                "locations": ["New York, NY"] if locations is None else locations,
+                "active": True, "is_visible": True, "posted_at": int(time.time()) - 600}
+
+    def test_titles_humans_label_new_grad(self):
+        for title in [
+            "Software Development Engineer 1 - Security Platform",
+            "Analyst \u2013 Early Career - Full Stack",
+            "Robotics Systems & Simulation Engineer",
+            "Associate Data Ops Engineer",
+            "Associate AI Engineer",
+            "Forward Deployed Engineer",
+            "Trading Technology Software Developer",
+            "Member of Technical Staff - ML Systems",
+            "Software Engineer 1 New Grad - Internal Tools",
+            "Software Engineer, Agent (New Grad 2027)",
+            "Product Engineer",
+            "Site Reliability Engineer",
+            "Quality Assurance Engineer",
+            "Junior Developer",
+        ]:
+            with self.subTest(title=title):
+                self.assertEqual(rejection_reason(self.job(title)), "matched")
+
+    def test_titles_still_rejected(self):
+        for title, reason in [
+            ("Senior Software Engineer", "excluded_seniority_or_internship"),
+            ("Sr. Data Scientist", "excluded_seniority_or_internship"),
+            ("Staff Machine Learning Engineer", "excluded_seniority_or_internship"),
+            ("Software Engineer III", "excluded_seniority_or_internship"),
+            ("Machine Learning Intern", "excluded_seniority_or_internship"),
+            ("Engineering Manager, Platform", "excluded_seniority_or_internship"),
+            ("Tech Lead, Payments", "excluded_seniority_or_internship"),
+            ("Mechanical Engineer", "outside_role_families"),
+            ("Hardware Test Engineer", "outside_role_families"),
+            ("Field Application Engineer", "outside_role_families"),
+            ("Financial Analyst", "outside_role_families"),
+            ("Account Executive", "excluded_seniority_or_internship"),
+            ("Product Designer", "outside_role_families"),
+        ]:
+            with self.subTest(title=title):
+                self.assertEqual(rejection_reason(self.job(title)), reason)
+
+    def test_experience_rules(self):
+        accepted = [
+            "Our customers run an industry that is 20-40 years behind on software.",
+            "With over 10 years of experience serving customers, we build tools.",
+            "Bachelor's degree or 4 years of relevant work experience.",
+            "2+ years of experience, or a Master's degree in Computer Science.",
+            "2+ years of experience, including internships or research.",
+            "Strong experience building ML systems in Python (coursework welcome).",
+            "You will work alongside experienced engineers.",
+            "3+ years of Go experience is a plus.",
+        ]
+        for description in accepted:
+            with self.subTest(description=description):
+                self.assertEqual(rejection_reason(self.job("Software Engineer", description)), "matched")
+        rejected = [
+            "Bachelor's degree in Computer Science or related field and 3+ years of experience.",
+            "Minimum of 5 years of professional software experience.",
+            "2+ years of professional experience building APIs.",
+        ]
+        for description in rejected:
+            with self.subTest(description=description):
+                self.assertEqual(
+                    rejection_reason(self.job("Software Engineer", description)), "too_much_experience"
+                )
+        self.assertEqual(rejection_reason(self.job(
+            "Full-Stack Software Engineer (New Grad)", "2+ years of experience with React."
+        )), "matched")
+
+    def test_location_rules(self):
+        self.assertEqual(rejection_reason(self.job("Software Engineer", locations=["Remote"])), "matched")
+        self.assertEqual(rejection_reason(self.job("Software Engineer", locations=[])), "matched")
+        self.assertEqual(rejection_reason(self.job(
+            "Software Engineer", locations=["Remote - US", "Remote - Canada"]
+        )), "matched")
+        for locations in (["London, UK"], ["Remote in Canada"], ["Bengaluru, India"]):
+            with self.subTest(locations=locations):
+                self.assertEqual(
+                    rejection_reason(self.job("Software Engineer", locations=locations)), "outside_us"
+                )
+
+    def test_citizenship_rules(self):
+        eeo = ("We consider all applicants without regard to race, religion, national origin, "
+               "or U.S. citizenship status.")
+        self.assertEqual(rejection_reason(self.job("Software Engineer", eeo)), "matched")
+        for description in (
+            "U.S. citizenship or permanent residency required.",
+            "Must be a U.S. person as defined by ITAR.",
+            "This role requires an active Secret clearance.",
+            "Ability to obtain a security clearance.",
+        ):
+            with self.subTest(description=description):
+                self.assertEqual(
+                    rejection_reason(self.job("Software Engineer", description)),
+                    "citizenship_requirement",
+                )
+
+    def test_excluded_companies(self):
+        for company in ("Jane Street", "SpaceX", "TikTok", "Hudson River Trading"):
+            with self.subTest(company=company):
+                self.assertEqual(
+                    rejection_reason(self.job("Software Engineer", company=company)),
+                    "excluded_company",
+                )
+        job = self.job("Software Engineer", company="Andurilindustries")
+        job["board_key"] = "greenhouse:andurilindustries"
+        self.assertEqual(rejection_reason(job), "excluded_company")
 
 
 def http_error(code: int) -> urllib.error.HTTPError:

@@ -57,233 +57,322 @@ SUPPORTED_PROVIDERS = {
     "ashby", "greenhouse", "lever", "lever-eu", "recruitee", "smartrecruiters",
     "workable",
 }
-JOB_FAMILY_TERMS = (
-    "software engineer",
-    "software developer",
-    "software development engineer",
-    "backend engineer",
-    "back-end engineer",
-    "frontend engineer",
-    "front-end engineer",
-    "full stack engineer",
-    "full-stack engineer",
-    "data engineer",
-    "analytics engineer",
-    "data analyst",
-    "machine learning engineer",
-    "ml engineer",
-    "mlops engineer",
-    "machine learning operations",
-    "ai engineer",
-    "ai platform engineer",
-    "llm engineer",
-    "generative ai engineer",
-    "inference engineer",
-    "nlp engineer",
-    "computer vision engineer",
-    "perception engineer",
-    "robotics software engineer",
-    "gpu engineer",
-    "cuda engineer",
-    "compiler engineer",
-    "performance engineer",
-    "data scientist",
-    "decision scientist",
-    "applied scientist",
-    "research engineer",
-    "research scientist",
-    "platform engineer",
-    "cloud engineer",
-    "infrastructure engineer",
-    "devops engineer",
-    "site reliability engineer",
-    "database engineer",
-    "storage engineer",
-    "distributed systems engineer",
-    "security engineer",
-    "qa automation engineer",
-    "software development engineer in test",
-    "sdet",
-    "forward deployed engineer",
-    "forward-deployed engineer",
-    "solutions engineer",
-    "technical solutions engineer",
-    "business intelligence engineer",
-    "product data analyst",
+# --- Role filter --------------------------------------------------------------
+# Recall first: accept anything in the software / data / ML area and reject only
+# clear disqualifiers (seniority, internships, 3+ years required, non-US,
+# citizenship or clearance, excluded companies). Measured against a curated
+# new-grad list with tools/eval_filter.py.
+
+ROLE_NOUN_RE = re.compile(
+    r"\b(?:engineers?|developers?|programmer|sde|swe|sdet|mts|technical staff|"
+    r"(?:software|data|ml|machine learning|platform|security) engineering)\b"
 )
-ENTRY_TITLE_TERMS = (
-    "new grad",
-    "new college grad",
-    "university grad",
-    "early career",
-    "entry level",
-    "entry-level",
-    "junior",
-    "associate software",
-    "engineer i",
-    "engineer 1",
-    "developer i",
-    "level 1",
-    "level i",
-    "analyst i",
-    "analyst 1",
-    "scientist i",
-    "scientist 1",
-    "early talent",
-    "campus hire",
+# Analyst / associate / scientist titles span every field, so they need a
+# software, data or ML word next to them.
+WEAK_ROLE_NOUN_RE = re.compile(r"\b(?:scientists?|researchers?|analysts?|associates?)\b")
+WEAK_ROLE_DOMAIN_RE = re.compile(
+    r"\b(?:software|data|analytics|bi|business intelligence|machine learning|ml|ai|"
+    r"artificial intelligence|deep learning|nlp|computer vision|quantitative|quant|"
+    r"computational|applied|decision|full[- ]?stack|technology|product|"
+    r"insights|statistic\w*)\b"
 )
-EXCLUDED_TERMS = (
-    "intern",
-    "internship",
-    "senior",
-    "staff",
-    "principal",
-    "manager",
-    "director",
-    "professor",
-    "technician",
+SELF_SUFFICIENT_ROLE_RE = re.compile(
+    r"\b(?:developers?|programmer|sde|swe|sdet|mts|member of (?:the )?technical staff)\b"
 )
+DOMAIN_RE = re.compile(
+    r"\b(?:software|sw|full[- ]?stack|back[- ]?end|front[- ]?end|web|mobile|ios|android|"
+    r"apps?|application|applications|platforms?|infrastructure|infra|cloud|devops|"
+    r"dev ops|sre|site reliability|production|systems software|embedded|firmware|"
+    r"kernel|operating systems?|compilers?|gpu|cuda|hpc|performance|inference|"
+    r"distributed|data|databases?|storage|analytics|bi|business intelligence|"
+    r"machine learning|ml|mlops|ai|artificial intelligence|deep learning|llms?|"
+    r"genai|generative|nlp|natural language|computer vision|vision|perception|"
+    r"autonomy|autonomous|robotics|simulation|graphics|games?|gameplay|security|"
+    r"cyber|cybersecurity|appsec|privacy|automation|qa|quality assurance|"
+    r"solutions|forward[- ]deployed|deployed|deployment|integrations?|"
+    r"implementation|tools|tooling|developer productivity|developer experience|"
+    r"products?|growth|payments|blockchain|crypto|smart contracts?|quantitative|"
+    r"quant|algorithms?|research|applied|decision|computational|"
+    r"scientific computing|python|java|c\+\+|golang|rust|javascript|typescript|"
+    r"react|node|salesforce|servicenow|search|ranking|recommendations?|"
+    r"networking|network software|observability|reliability|generalist|"
+    r"technology)\b"
+)
+HARDWARE_RE = re.compile(
+    r"\b(?:mechanical|civil|structural|electrical|electronics?|hardware|"
+    r"manufacturing|process|chemical|rf|analog|mixed[- ]signal|asic|fpga|soc|"
+    r"silicon|vlsi|layout|pcb|packaging|materials|industrial|environmental|"
+    r"facilities|facility|physical|construction|field|propulsion|avionics|thermal|optical|optics|"
+    r"photonics|mechatronics|power|battery|hvac|geotechnical|transportation|"
+    r"traffic|water|mining|petroleum|nuclear|biomedical|clinical|quality|test|"
+    r"validation|verification|sales|service|maintenance|reliability)\b"
+)
+SOFTWARE_CORE_RE = re.compile(
+    r"\b(?:software|sw|full[- ]?stack|back[- ]?end|front[- ]?end|web|mobile|cloud|"
+    r"devops|sre|site reliability|data|machine learning|ml|ai|llms?|"
+    r"firmware|embedded software|test automation|sdet|quality assurance|"
+    r"developers?|programmer|python|java|c\+\+|bi)\b"
+)
+EXCLUDED_TITLE_RE = re.compile(
+    r"\b(?:intern|interns|internship|internships|co-?op|senior|sr|staff|principal|"
+    r"lead|leader|manager|director|head|vp|vice president|chief|cto|distinguished|"
+    r"professor|lecturer|postdoc(?:toral)?|post-doc|technician|recruiter|"
+    r"account executive|experienced|expert|mid[- ]?level|iii|iv|v|vi|3|4|5|contractor|"
+    r"part[- ]time|fixed[- ]term|temporary|temp|annotat\w*|tutor|raters?|speakers?|"
+    r"contract (?:student|worker|role|position)|extern|externship|flexible hours|"
+    r"freelance|hourly)\b|\(contract\)|- contract\b"
+)
+TECHNICAL_STAFF_RE = re.compile(r"\b(?:member of (?:the )?)?technical staff\b")
+NEW_GRAD_TITLE_RE = re.compile(
+    r"new grad|new college grad|university grad|graduate|early career|"
+    r"entry[- ]level|campus|class of 20\d\d|junior|\bassociate\b|early talent"
+)
+# Your standing exclusions: prop/quant trading, ByteDance/TikTok, aerospace and
+# defense. Extend or trim in state/excluded_companies.json (a JSON list of names).
+DEFAULT_EXCLUDED_COMPANIES = (
+    # proprietary and quant trading
+    "Hudson River Trading", "HRT", "Five Rings", "Susquehanna",
+    "Susquehanna International Group", "SIG", "Optiver", "Belvedere Trading",
+    "Jane Street", "Citadel", "Citadel Securities", "DRW", "Jump Trading",
+    "Wolverine Trading", "IMC", "IMC Trading", "Headlands Technologies", "Akuna Capital",
+    "Old Mission", "Virtu", "Virtu Financial", "Flow Traders", "Tower Research Capital",
+    "XTX Markets", "Radix Trading", "Chicago Trading Company", "PEAK6", "Maven Securities",
+    "Da Vinci", "Tradebot", "Two Sigma", "D. E. Shaw", "DE Shaw", "Renaissance Technologies",
+    "Hudsonrivertrading", "Fiverings", "Janestreet", "Jumptrading", "Belvederetrading",
+    # ByteDance / TikTok
+    "ByteDance", "TikTok",
+    # aerospace and defense
+    "SpaceX", "Anduril", "Anduril Industries", "Andurilindustries", "Shield AI", "Shieldai",
+    "Saronic", "Lockheed Martin", "Northrop Grumman", "Raytheon", "RTX", "Boeing",
+    "General Dynamics", "L3Harris", "BAE Systems", "Leidos", "Peraton",
+    "Booz Allen Hamilton", "CACI", "SAIC", "ManTech", "Huntington Ingalls", "Textron",
+    "Rocket Lab", "Rocketlab", "Relativity Space", "Relativity", "Blue Origin",
+    "United Launch Alliance", "ULA", "Sierra Space", "Firefly Aerospace", "Astranis",
+    "Palantir", "Palantir Technologies", "Accenture Federal Services",
+    "Accenturefederalservices", "CGS Federal", "Cgsfederal", "Voyager Technologies",
+    "Voyagertechnologiesinc", "Epirus", "Castelion", "Hadrian", "Skydio", "Hermeus",
+    "Joby Aviation", "Archer Aviation", "Boom Supersonic", "Varda Space", "K2 Space",
+    "Apex Space", "Vast", "Shield", "f7d8749a-72d6-407c-bf98-292ea630c73a",
+    "Fantom Corporation", "Graham Capital Management", "Grahamcapitalmanagement",
+)
+EXCLUDED_COMPANIES_PATH = STATE_DIR / "excluded_companies.json"
 US_STATE_CODES = (
     "AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|"
     "MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|"
     "VT|VA|WA|WV|WI|WY|DC"
 )
-US_LOCATION_RE = re.compile(rf"(?:,|\s)\s*(?:{US_STATE_CODES})(?:\b|$)", re.I)
-US_LOCATION_TERMS = (
-    "united states",
-    "usa",
-    "u.s.",
-    "remote in us",
-    "remote - us",
-    "us remote",
-    "new york city",
-    "nyc",
-    "san francisco",
-    "sf",
-    "washington, dc",
-)
-CANADA_LOCATION_TERMS = (
-    "canada",
-    "remote in canada",
-    "remote - canada",
-    "canadian",
-)
-ENTRY_DESCRIPTION_RE = re.compile(
-    r"\b(?:new|recent) (?:college )?graduate\b|\bearly career\b|"
-    r"\bentry[ -]level\b|\b0\s*(?:-|to)\s*2 years\b|"
-    r"\b1\s*(?:-|to)\s*2 years\b|\b(?:up to|less than) 2 years\b|"
-    r"\bno (?:prior |professional )?experience (?:is )?required\b",
+# Case-sensitive on purpose: "Remote in Canada" must not read as Indiana.
+US_STATE_CODE_RE = re.compile(rf",\s*(?:{US_STATE_CODES})\b")
+US_LOCATION_RE = re.compile(
+    r"\b(?:united states|usa|u\.s\.a?\.?|us|america|"
+    r"alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|"
+    r"florida|georgia|hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|"
+    r"maryland|massachusetts|michigan|minnesota|mississippi|missouri|montana|"
+    r"nebraska|nevada|new hampshire|new jersey|new mexico|new york|north carolina|"
+    r"north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|south carolina|"
+    r"south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|"
+    r"wisconsin|wyoming|"
+    r"nyc|sf|bay area|silicon valley|san francisco|seattle|boston|austin|chicago|"
+    r"los angeles|san diego|san jose|palo alto|mountain view|menlo park|sunnyvale|"
+    r"santa clara|redwood city|oakland|berkeley|redmond|bellevue|kirkland|denver|"
+    r"boulder|atlanta|miami|dallas|houston|pittsburgh|philadelphia|baltimore|"
+    r"raleigh|durham|nashville|salt lake city|phoenix|portland|minneapolis|detroit|"
+    r"ann arbor|madison|columbus|cambridge, ma|somerville|arlington, va|"
+    r"jersey city|hoboken|brooklyn|manhattan|irvine|santa monica|culver city)\b",
     re.I,
 )
-CITIZENSHIP_REQUIREMENT_RE = re.compile(
-    r"\b(?:us\s+citizen(?:s|ship)?|u\.s\.\s+citizen(?:s|ship)?|"
-    r"citizenship\s+required|citizenship\s+is\s+required|"
-    r"must\s+be\s+(?:a\s+|an\s+)?citizen(?:s|ship)?|"
-    r"only\s+(?:us\s+)?citizens?|"
-    r"must\s+be\s+(?:a\s+|an\s+)?us\s+citizen(?:s|ship)?)\b",
-    re.I | re.S,
+NON_US_LOCATION_RE = re.compile(
+    r"\b(?:canada|toronto|vancouver|montreal|ontario|quebec|united kingdom|uk|"
+    r"england|london|ireland|dublin|germany|berlin|munich|france|paris|spain|"
+    r"madrid|barcelona|portugal|lisbon|netherlands|amsterdam|poland|warsaw|"
+    r"switzerland|zurich|sweden|stockholm|denmark|norway|finland|israel|tel aviv|"
+    r"india|bangalore|bengaluru|hyderabad|pune|chennai|delhi|mumbai|singapore|"
+    r"japan|tokyo|korea|seoul|china|beijing|shanghai|shenzhen|hong kong|taiwan|"
+    r"taipei|australia|sydney|melbourne|new zealand|brazil|sao paulo|mexico|"
+    r"argentina|colombia|chile|emea|apac|latam|europe|eu|philippines|vietnam|"
+    r"indonesia|malaysia|thailand|pakistan|nigeria|kenya|egypt|south africa|uae|"
+    r"dubai|saudi|qatar|turkey|istanbul|romania|bucharest|ukraine|czech|prague|"
+    r"hungary|budapest|greece|italy|milan|rome|belgium|brussels|austria|vienna|"
+    r"estonia|serbia|belgrade|costa rica|peru)\b",
+    re.I,
 )
+GENERIC_LOCATION_RE = re.compile(
+    r"^(?:remote|anywhere|hybrid|flexible|distributed|virtual|work from home|wfh|"
+    r"multiple locations|various locations|\d+ locations|remote[- ]first|tbd|)$",
+    re.I,
+)
+ENTRY_DESCRIPTION_RE = re.compile(
+    r"\b(?:new|recent) (?:college |university )?grad(?:uate)?s?\b|\bearly career\b|"
+    r"\bentry[ -]level\b|\b0\s*(?:-|to)\s*[123] years?\b|"
+    r"\b1\s*(?:-|to)\s*[23] years?\b|\b(?:up to|less than) [23] years?\b|"
+    r"\bno (?:prior |professional )?experience (?:is )?(?:required|necessary)\b|"
+    r"\bclass of 20\d\d\b|\bgraduating (?:in|by) 20\d\d\b",
+    re.I,
+)
+_US = r"(?:u\.?\s?s\.?|united states)"
+CITIZENSHIP_REQUIREMENT_RE = re.compile(
+    rf"\b(?:must|required to|need to|needs to)\s+(?:be|hold|have|possess)\s+"
+    rf"(?:a\s+|an\s+)?(?:{_US}\s+)?citizen(?:s|ship)?\b"
+    rf"|\b{_US}\s+citizenship\s+(?:is\s+)?(?:required|a requirement|mandatory)\b"
+    rf"|\brequires?\s+{_US}\s+citizenship\b"
+    rf"|\b{_US}\s+citizens?\s+only\b|\bonly\s+(?:{_US}\s+)?citizens\b"
+    rf"|\bcitizenship\s+(?:is\s+)?required\b"
+    rf"|\b{_US}\s+citizen(?:ship|s)?\s+or\s+(?:lawful\s+)?permanent\s+residen"
+    rf"|\b(?:active|current)\s+(?:(?:top\s+)?secret|ts/sci|security|government)\s+clearance\b"
+    rf"|\b(?:ability|able)\s+to\s+(?:obtain|acquire|get)\s+(?:and\s+maintain\s+)?"
+    rf"(?:a\s+|an\s+)?(?:{_US}\s+)?(?:government\s+)?(?:security\s+)?clearance\b"
+    rf"|\bmust\s+be\s+(?:a\s+)?{_US}\s+persons?\b|\b{_US}\s+person\s+(?:status\s+)?(?:is\s+)?required\b",
+    re.I,
+)
+WORD_NUMBERS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+YEARS_RE = re.compile(
+    r"\b(?P<low>\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\s*"
+    r"(?:\+|plus)?\s*(?:(?:-|–|to)\s*(?P<high>\d{1,2})\s*\+?\s*)?(?:years?|yrs?)\b",
+    re.I,
+)
+REQUIREMENT_CUE_RE = re.compile(
+    r"experien|required|requires|requirement|minimum|at least|must have",
+    re.I,
+)
+COMPANY_HISTORY_RE = re.compile(
+    r"(?:over|more than|nearly|almost|for (?:the )?(?:past|last))\s*$", re.I
+)
+PREFERRED_CUE_RE = re.compile(
+    r"\b(?:preferred|nice[- ]to[- ]have|bonus|(?:is|are|a|big) plus|ideally|desired|"
+    r"desirable|preferably)\b",
+    re.I,
+)
+# Sentences where the years are an alternative a new grad can satisfy:
+# "or a Master's", "with a PhD", "degree or 4 years", "internships count".
+NEW_GRAD_SUBSTITUTE_RE = re.compile(
+    r"\b(?:or|with)\s+(?:an?\s+|the\s+)?(?:master'?s|ms|m\.s\.|mba|ph\.?d\.?|doctorate|"
+    r"graduate degree|advanced degree)\b"
+    r"|\bdegree\b[^.;]{0,80}?\bor\s+(?:\d{1,2}|one|two|three|four|five|six)\s*\+?\s*(?:years?|yrs)"
+    r"|\binternships?\b|\bco-?ops?\b|\bacademic\b|\bcoursework\b|\bresearch experience\b"
+    r"|\bexperienced hires?\b|\bfor senior\b",
+    re.I,
+)
+SENIOR_PHRASE_RE = re.compile(
+    r"\bsenior[- ]level experience\b|\bseasoned (?:software )?engineer\b|"
+    r"\b(?:an?|seeking|looking for)\s+(?:highly\s+)?experienced\s+"
+    r"(?:software\s+|backend\s+|full[- ]stack\s+)?engineer\b(?!s)",
+    re.I,
+)
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+|\n+|\s+[•·▪]\s*|\s+-\s+(?=[A-Z])")
+
+
+def normalize_title(title: object) -> str:
+    text = html.unescape(str(title or "")).lower().replace(" ", " ")
+    text = re.sub(r"[‐-―−]", "-", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_company(value: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def load_excluded_companies() -> set[str]:
+    names = list(DEFAULT_EXCLUDED_COMPANIES)
+    try:
+        if EXCLUDED_COMPANIES_PATH.exists():
+            names = json.loads(EXCLUDED_COMPANIES_PATH.read_text())
+    except (OSError, ValueError) as exc:
+        print(f"job-watcher: ignoring unreadable {EXCLUDED_COMPANIES_PATH}: {exc}", file=sys.stderr)
+    return {normalize_company(name) for name in names if normalize_company(name)}
+
+
+EXCLUDED_COMPANIES = load_excluded_companies()
+
+
+def is_excluded_company(job: dict) -> bool:
+    candidates = [job.get("company_name")]
+    board_key = str(job.get("board_key") or "")
+    if ":" in board_key:
+        candidates.append(board_key.split(":", 1)[1])
+    return any(normalize_company(value) in EXCLUDED_COMPANIES for value in candidates if value)
+
+
+def in_role_family(title: object) -> bool:
+    text = normalize_title(title)
+    core_text = re.sub(r"\bdata ?cent(?:er|re)s?\b", " ", text)
+    if HARDWARE_RE.search(text) and not SOFTWARE_CORE_RE.search(core_text):
+        return False
+    if ROLE_NOUN_RE.search(text):
+        return bool(SELF_SUFFICIENT_ROLE_RE.search(text) or DOMAIN_RE.search(text))
+    noun = WEAK_ROLE_NOUN_RE.search(text)
+    if not noun:
+        return False
+    if noun.group(0).startswith(("scientist", "researcher")) and re.search(r"\bresearch\b", text):
+        return True
+    return bool(WEAK_ROLE_DOMAIN_RE.search(text))
+
+
+def has_excluded_title(title: object) -> bool:
+    text = TECHNICAL_STAFF_RE.sub(" ", normalize_title(title))
+    return bool(EXCLUDED_TITLE_RE.search(text))
+
+
+def title_rejection(title: object) -> str | None:
+    if has_excluded_title(title):
+        return "excluded_seniority_or_internship"
+    if not in_role_family(title):
+        return "outside_role_families"
+    return None
 
 
 def is_us_location(locations: list[str]) -> bool:
-    lowered_locations = [str(value).lower() for value in locations]
-    if any(
-        any(term == location or term in location for term in CANADA_LOCATION_TERMS)
-        for location in lowered_locations
-    ):
+    values = [re.sub(r"\s+", " ", str(value)).strip() for value in locations or []]
+    if any(US_STATE_CODE_RE.search(value) or US_LOCATION_RE.search(value) for value in values):
+        return True
+    if any(NON_US_LOCATION_RE.search(value) for value in values):
         return False
-    return any(
-        US_LOCATION_RE.search(location)
-        or any(term == location or term in location for term in US_LOCATION_TERMS)
-        for location in lowered_locations
-    )
+    # "Remote", "Hybrid" or nothing at all: the registry is US-heavy, so keep it.
+    return all(GENERIC_LOCATION_RE.match(value.strip(" ,;()-")) for value in values)
 
 
 def description_mentions_citizenship_requirement(description: str) -> bool:
-    if CITIZENSHIP_REQUIREMENT_RE.search(description):
-        return False
-    return True
+    """False when the posting requires citizenship, a US-person status or a clearance."""
+    return not CITIZENSHIP_REQUIREMENT_RE.search(description or "")
 
 
 def potential_match(job: dict) -> bool:
-    if not job.get("active") or not job.get("is_visible", True):
-        return False
-    if not job_is_recent(job):
-        return False
-    if not digest_has_real_recent_posted_time(job):
-        return False
-    title = str(job.get("title", "")).lower()
-    if any(term in title for term in EXCLUDED_TERMS):
-        return False
-    locations = job.get("locations") or []
-    description = str(job.get("description", ""))
-    role_match = any(term in title for term in JOB_FAMILY_TERMS)
-    entry_match = any(term in title for term in ENTRY_TITLE_TERMS) or bool(
-        ENTRY_DESCRIPTION_RE.search(description)
-    )
-    return role_match and entry_match and is_us_location(locations)
+    return rejection_reason(job) not in {
+        "inactive", "missing_posted_time", "outside_24_hours", "excluded_company",
+        "excluded_seniority_or_internship", "outside_role_families", "outside_us",
+    }
 
 
-
-EXPERIENCE_REQUIREMENT_RE = re.compile(
-    r"""
-    (?:
-        (?P<plus>\b\d+\s*\+\s*years?\b) |
-        (?P<range>\b\d+\s*(?:-|to)\s*\d+\s*years?\b) |
-        (?P<minimum>\b(?:minimum|min\.?|at\s+least|requires?|requirement|must\s+have)\s+\d+\s*\+?\s*years?\b) |
-        (?P<plain>\b\d+\s*years?\s+(?:of\s+)?(?:professional\s+)?experience\b)
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-
-def asks_for_too_much_experience(text: str) -> bool:
-    lowered = text.lower()
-
-    allowed_patterns = [
-        r"\b0\s*(?:-|to)\s*1\s*years?\b",
-        r"\b0\s*(?:-|to)\s*2\s*years?\b",
-        r"\b1\s*(?:-|to)\s*2\s*years?\b",
-        r"\bup\s+to\s+2\s+years?\b",
-    ]
-    if any(re.search(pattern, lowered) for pattern in allowed_patterns):
-        return False
-
-    for match in EXPERIENCE_REQUIREMENT_RE.finditer(lowered):
-        numbers = [int(value) for value in re.findall(r"\d+", match.group(0))]
-        if not numbers:
+def required_years(text: str) -> int | None:
+    """Smallest years-of-experience figure stated as a hard requirement."""
+    found = []
+    for sentence in SENTENCE_SPLIT_RE.split(text or ""):
+        if PREFERRED_CUE_RE.search(sentence) or NEW_GRAD_SUBSTITUTE_RE.search(sentence):
             continue
+        for match in YEARS_RE.finditer(sentence):
+            raw = match.group("low").lower()
+            low = WORD_NUMBERS.get(raw) or int(raw)
+            if low > 15 or COMPANY_HISTORY_RE.search(sentence[max(0, match.start() - 25): match.start()]):
+                continue
+            window = sentence[max(0, match.start() - 50): match.end() + 80]
+            if REQUIREMENT_CUE_RE.search(window):
+                found.append(low)
+    return min(found) if found else None
 
-        phrase = match.group(0)
 
-        # Reject 2+ years, 3+ years, minimum 2 years, minimum 3 years, etc.
-        if "+" in phrase and numbers[0] >= 2:
+def asks_for_too_much_experience(text: str, title: object = "") -> bool:
+    lowered = (text or "").lower()
+    if re.search(r"\b(?:0|1|2)\s*(?:-|–|to)\s*[123]\s*years?\b|\bup\s+to\s+[23]\s+years?\b", lowered):
+        return False
+    years = required_years(text)
+    if years is not None:
+        if years >= 3:
             return True
-
-        # Reject ranges whose lower bound starts at 2 or above: 2-4, 3-5, etc.
-        if ("-" in phrase or " to " in phrase) and numbers[0] >= 2:
+        if years == 2 and not NEW_GRAD_TITLE_RE.search(normalize_title(title)):
             return True
-
-        # Reject explicit minimum/required years >= 2
-        if any(word in phrase for word in ["minimum", "min", "at least", "require", "must have"]) and numbers[0] >= 2:
-            return True
-
-        # Reject plain "3 years of experience", "4 years experience", etc.
-        if numbers[0] > 2:
-            return True
-
-    senior_phrases = [
-        "senior-level experience",
-        "senior level experience",
-        "seasoned engineer",
-        "experienced engineer",
-        "extensive experience",
-        "deep experience",
-        "proven experience",
-        "strong experience building",
-    ]
-    return any(phrase in lowered for phrase in senior_phrases)
+    return bool(SENIOR_PHRASE_RE.search(text or ""))
 
 
 def matches(job: dict) -> bool:
@@ -300,19 +389,15 @@ def rejection_reason(job: dict, now: int | None = None) -> str:
     age = current_time - posted_at
     if age < -FUTURE_TIMESTAMP_GRACE_SECONDS or age > MAX_JOB_AGE_SECONDS:
         return "outside_24_hours"
-    title = str(job.get("title", "")).lower()
-    if any(term in title for term in EXCLUDED_TERMS):
-        return "excluded_seniority_or_internship"
-    if not any(term in title for term in JOB_FAMILY_TERMS):
-        return "outside_role_families"
+    if is_excluded_company(job):
+        return "excluded_company"
+    title = str(job.get("title", ""))
+    title_reason = title_rejection(title)
+    if title_reason:
+        return title_reason
     description = str(job.get("description", ""))
-    if asks_for_too_much_experience(f"{title} {description}"):
+    if asks_for_too_much_experience(f"{title}. {description}", title):
         return "too_much_experience"
-    if not (
-        any(term in title for term in ENTRY_TITLE_TERMS)
-        or ENTRY_DESCRIPTION_RE.search(description)
-    ):
-        return "missing_entry_level_evidence"
     if not is_us_location(job.get("locations") or []):
         return "outside_us"
     if not description_mentions_citizenship_requirement(description):
@@ -870,9 +955,7 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
                     continue
                 title = str(item.get("name", ""))
                 lowered_title = title.lower()
-                if not any(term in lowered_title for term in JOB_FAMILY_TERMS):
-                    continue
-                if any(term in lowered_title for term in EXCLUDED_TERMS):
+                if title_rejection(title):
                     continue
                 posting_id = str(item.get("id", ""))
                 detail = fetch_json(

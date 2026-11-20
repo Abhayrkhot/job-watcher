@@ -5,6 +5,38 @@ US-remote entry-level technical roles that do not include an explicit citizenshi
 requirement. SQLite state prevents duplicate mail and records a heartbeat so
 missed runs are visible in the logs.
 
+## Filter
+
+The goal is to be among the first applicants, so the filter favors recall. It
+accepts anything in the software, data, and ML area and rejects only clear
+disqualifiers:
+
+- **Seniority and gigs in the title**: senior, staff (except "Member of Technical
+  Staff"), principal, lead, manager, III and above, plus internships, co-ops,
+  contract, part-time, temporary, and annotation work. Words are matched whole,
+  so "Internal Tools" is not an internship.
+- **Role family**: engineer and developer titles need a software, data, or ML word
+  ("Software Development Engineer 1", "Forward Deployed Engineer"). Analyst,
+  associate, and scientist titles need a data or ML word next to them. Hardware,
+  mechanical, and manufacturing titles are dropped unless they also say software.
+- **Experience**: rejected only when a hard requirement asks for 3+ years, or for
+  2+ years with no new-grad signal. "Or a Master's", "degree or 4 years",
+  "including internships", and "is a plus" don't count as requirements, and
+  numbers that aren't about experience ("20-40 years behind") are ignored.
+- **Location**: at least one US location, or only "Remote"/"Hybrid". A role open
+  in both the US and Canada is kept.
+- **Work authorization**: rejected when it requires U.S. citizenship, permanent
+  residency, U.S.-person status, or a security clearance. Equal-opportunity text
+  about "citizenship status" is not a requirement.
+- **Companies**: prop and quant trading, ByteDance/TikTok, and aerospace/defense are
+  excluded by default. Put a JSON list of names in `state/excluded_companies.json`
+  to replace the default list.
+
+`python3 tools/eval_filter.py` measures the filter against SimplifyJobs' curated
+new-grad list. It fetches the live postings and reports recall and a precision
+sample. In November 2026, recall on in-scope roles went from 6% to 63%. Most of
+the remaining misses are contract, annotation, and non-technical roles.
+
 The watcher polls a reviewed registry of employer career boards through public
 Greenhouse, Lever, Ashby, SmartRecruiters, Recruitee, and Workable APIs. Each run
 checks up to 200 due boards. Boards with a current match run every 30 minutes,
