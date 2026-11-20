@@ -1,9 +1,10 @@
 # Source Policy
 
-This personal job watcher uses only documented public APIs, provider-approved API
-keys, and user-configured native alerts. It does not scrape restricted websites,
-use authenticated browser sessions, evade access controls, rotate proxies, solve
-CAPTCHAs, or call private application endpoints.
+This personal job watcher uses documented public APIs, provider-approved API keys,
+user-configured native alerts, and the unauthenticated endpoints that companies'
+public careers pages load (see "Career-site endpoints" below). It does not scrape
+sites that require login, use authenticated browser sessions or cookies, evade
+access controls or rate limits, rotate proxies, or solve CAPTCHAs.
 
 This is an engineering policy, not legal advice. Provider terms can change and must
 be reviewed before adding a source.
@@ -20,6 +21,28 @@ be reviewed before adding a source.
 | Workable | Documented public account jobs endpoint | Published jobs; reviewed accounts only |
 | RSS/Atom/JSON feeds | Publisher-provided public feed | Explicit review and allowlist required |
 
+## Career-site endpoints
+
+Enabled on 2026-11-20 by the owner's decision, so the watcher can see the roughly
+two thirds of new-grad roles that are posted on these systems. Each endpoint is the
+one the company's own public careers page calls, without login or cookies, and is
+read at the cadence of the watcher's normal polling.
+
+| Source | Endpoint | Constraints |
+| --- | --- | --- |
+| Workday | `POST https://<tenant>.wdN.myworkdayjobs.com/wday/cxs/<tenant>/<site>/jobs` and the matching job detail GET | 20 newest postings per page, at most 5 pages; details only for new IDs |
+| Oracle Recruiting Cloud | `GET /hcmRestApi/resources/latest/recruitingCEJobRequisitions` and `...JobRequisitionDetails` | 50 newest per poll; details only for new IDs |
+| BambooHR | `GET https://<company>.bamboohr.com/careers/list` and `/careers/<id>/detail` | Details only for new IDs |
+| Rippling | `GET https://api.rippling.com/platform/api/ats/v1/board/<slug>/jobs` | Details only for new IDs |
+| JazzHR | `GET https://app.jazz.co/feeds/export/jobs/<company>` (syndication XML) | One request per poll |
+| Jobvite | `GET https://jobs.jobvite.com/<company>/jobs` and the job page (HTML) | Details only for new IDs |
+| SimplifyJobs lists | `listings.json` from the public New-Grad-Positions and Summer2027-Internships GitHub repos | Conditional GET with gzip; board discovery at most daily; new-grad list at most every 15 minutes |
+
+All readers share the global limits: 8 concurrent requests, at most 25 detail
+fetches per board per poll, and the first poll of a board records existing IDs
+without fetching any details. iCIMS, Taleo, Eightfold, and SuccessFactors are not
+read.
+
 ## Optional Approved Sources
 
 - Jobicy: its documented public API is queried with `geo=usa` every six hours.
@@ -32,10 +55,6 @@ be reviewed before adding a source.
   relevant active board is available for validation.
 - LinkedIn and Jobright: native alerts only. No crawling, browser automation, cookie
   reuse, or private API calls.
-- Workday, iCIMS, Taleo, Eightfold, and BambooHR: do not use undocumented
-  career-site endpoints. Add only a documented public interface or an approved API key.
-- JazzHR: use only an official customer XML feed URL supplied for syndication. Its
-  documentation describes a global JSON feed but does not publish the endpoint.
 
 ## References
 

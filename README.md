@@ -37,9 +37,27 @@ new-grad list. It fetches the live postings and reports recall and a precision
 sample. In November 2026, recall on in-scope roles went from 6% to 63%. Most of
 the remaining misses are contract, annotation, and non-technical roles.
 
-The watcher polls a reviewed registry of employer career boards through public
-Greenhouse, Lever, Ashby, SmartRecruiters, Recruitee, and Workable APIs. Each run
-checks up to 200 due boards. Boards with a current match run every 30 minutes,
+## Sources and discovery
+
+The watcher polls a registry of employer career boards (`state/ats_boards.json`)
+through the public Greenhouse, Lever, Ashby, SmartRecruiters, Recruitee, and
+Workable APIs, plus the endpoints that Workday, Oracle Recruiting, BambooHR,
+Rippling, JazzHR, and Jobvite careers pages load. Those six cover about two thirds
+of curated new-grad roles. Workday, Oracle, BambooHR, Rippling, and Jobvite list
+cheaply and fetch the full posting only for job IDs they haven't seen. When a
+provider gives only a posting date, a job seen for the first time within two days
+of that date is stamped with the time it was detected.
+
+The registry grows on its own. Once a day the watcher reads SimplifyJobs' public
+New-Grad-Positions and Summer2027-Internships `listings.json`. It turns every
+Software or AI/ML/Data apply link from the past year into a board, and adds the
+boards it doesn't already have, using Simplify's company name. Companies on your
+excluded list are skipped. The new-grad list is also read every 15 minutes, with a
+conditional GET, as a backstop source for roles on systems the watcher can't read
+(iCIMS, custom career sites). A role found both directly and through Simplify is
+mailed once.
+
+Each run checks up to 200 due boards. Boards with a current match run every 30 minutes,
 boards with three or more relevant roles every hour, boards with some relevant
 roles every three hours, and quiet boards every 12 hours. Boards that answer with
 an HTTP error retry after 5 and then 10 minutes, and after a third failure wait a
@@ -120,6 +138,5 @@ but remain eligible for the watcher's 24-hour freshness window.
 LinkedIn, Jobright, Indeed, and similar authenticated boards are not crawled.
 Their native alerts can be used alongside this watcher, but ingesting them cannot
 reliably enforce the 24-hour and US-only rules unless the provider supplies a
-documented API or structured feed. Workday, iCIMS, Taleo, Eightfold, and BambooHR
-are added only when a documented public job-listing interface is
-available and validated; private career-site endpoints are not used.
+documented API or structured feed. iCIMS, Taleo, Eightfold, and SuccessFactors are
+not read directly; roles there reach the watcher only through the Simplify backstop.

@@ -529,6 +529,7 @@ class FilterRecallTests(unittest.TestCase):
             ("Financial Analyst", "outside_role_families"),
             ("Account Executive", "excluded_seniority_or_internship"),
             ("Product Designer", "outside_role_families"),
+            ("MBA Summer Associate, Strategy & Analytics - Summer 2027", "excluded_seniority_or_internship"),
         ]:
             with self.subTest(title=title):
                 self.assertEqual(rejection_reason(self.job(title)), reason)
@@ -564,6 +565,7 @@ class FilterRecallTests(unittest.TestCase):
     def test_location_rules(self):
         self.assertEqual(rejection_reason(self.job("Software Engineer", locations=["Remote"])), "matched")
         self.assertEqual(rejection_reason(self.job("Software Engineer", locations=[])), "matched")
+        self.assertEqual(rejection_reason(self.job("Software Engineer", locations=["LA"])), "matched")
         self.assertEqual(rejection_reason(self.job(
             "Software Engineer", locations=["Remote - US", "Remote - Canada"]
         )), "matched")
@@ -744,6 +746,7 @@ class MainRunTests(unittest.TestCase):
             patch("job_watcher.fetch_direct_board", side_effect=fetch_board),
             patch("job_watcher.send_email"),
             patch("job_watcher.send_health_report_if_due"),
+            patch("job_watcher.fetch_simplify", return_value=[]),
             patch("job_watcher.sys.argv", ["job_watcher.py"]),
         ]
         if fetch_json is not None:
@@ -764,6 +767,43 @@ class MainRunTests(unittest.TestCase):
             )
         }
         return stats, json.loads(registry.read_text())
+
+    def test_workday_baseline_then_new_job_is_emailed(self):
+        board = {"provider": "workday", "slug": "acme.wd5.myworkdayjobs.com/acme/Careers", "company": "Acme"}
+        postings = [{"title": "Software Engineer", "externalPath": "/job/NYC/SE_R-1", "postedOn": "Posted Today"}]
+        detail_calls = []
+
+        def fetch_json(url, data=None):
+            if url.endswith("/jobs"):
+                return {"total": len(postings), "jobPostings": list(postings)}
+            detail_calls.append(url)
+            return {"jobPostingInfo": {"title": "Software Engineer, New Grad", "jobDescription": "Build.",
+                                       "location": "New York, NY", "startDate": TODAY}}
+
+        with patch("job_watcher.fetch_json", side_effect=fetch_json), \
+                patch("job_watcher.select_due_boards", side_effect=lambda c, b, n: b):
+            directory = Path(tempfile.mkdtemp())
+            registry = directory / "ats_boards.json"
+            registry.write_text(json.dumps([board]))
+            with patch("job_watcher.STATE_DIR", directory), \
+                    patch("job_watcher.DB_PATH", directory / "jobs.sqlite3"), \
+                    patch("job_watcher.BOARDS_PATH", registry), \
+                    patch("job_watcher.load_feeds", return_value=[]), \
+                    patch("job_watcher.wait_for_network", return_value=True), \
+                    patch("job_watcher.fetch_due_aggregators", return_value=[]), \
+                    patch("job_watcher.fetch_simplify", return_value=[]), \
+                    patch("job_watcher.send_health_report_if_due"), \
+                    patch("job_watcher.sys.argv", ["job_watcher.py"]), \
+                    patch("job_watcher.send_email") as send_email:
+                job_watcher.main()                      # first poll: baseline
+                self.assertEqual(detail_calls, [])
+                send_email.assert_not_called()
+                postings.insert(0, {"title": "Software Engineer, New Grad",
+                                    "externalPath": "/job/NYC/SE-NG_R-2", "postedOn": "Posted Today"})
+                job_watcher.main()                      # second poll: one new id
+                self.assertEqual(len(detail_calls), 1)
+                self.assertEqual([job["title"] for job in send_email.call_args[0][0]],
+                                 ["Software Engineer, New Grad"])
 
     def test_offline_batch_leaves_boards_due_and_skips_aggregators(self):
         def fetch_board(board):
@@ -812,6 +852,206 @@ class MainRunTests(unittest.TestCase):
         )
         self.assertNotIn({"provider": "greenhouse", "slug": "benchling"}, registry)
         self.aggregators.assert_called_once()
+
+
+
+TODAY = time.strftime("%Y-%m-%d", time.gmtime())
+
+
+class CareerSiteTests(unittest.TestCase):
+    def test_workday_lists_then_fetches_only_new_recent_titles(self):
+        board = {"provider": "workday", "slug": "acme.wd5.myworkdayjobs.com/acme/Careers",
+                 "company": "Acme", "_known_ids": frozenset({"Data-Engineer_R-1"})}
+        listing = {"total": 3, "jobPostings": [
+            {"title": "Software Engineer, New Grad", "externalPath": "/job/NYC/Software-Engineer_R-3", "postedOn": "Posted Today", "locationsText": "New York, NY"},
+            {"title": "Senior Accountant", "externalPath": "/job/NYC/Senior-Accountant_R-2", "postedOn": "Posted Today"},
+            {"title": "Data Engineer", "externalPath": "/job/NYC/Data-Engineer_R-1", "postedOn": "Posted Yesterday"},
+        ]}
+        detail = {"jobPostingInfo": {"title": "Software Engineer, New Grad", "jobDescription": "<p>Build things.</p>",
+                  "location": "New York, NY", "country": {"descriptor": "United States of America"},
+                  "startDate": TODAY, "externalUrl": "https://acme.wd5.myworkdayjobs.com/Careers/job/NYC/Software-Engineer_R-3"}}
+        calls = []
+
+        def fetch(url, data=None):
+            calls.append(url)
+            return listing if url.endswith("/jobs") else detail
+
+        with patch("job_watcher.fetch_json", side_effect=fetch):
+            jobs = job_watcher.fetch_workday_board(board, now=int(time.time()))
+        self.assertEqual([job["title"] for job in jobs], ["Software Engineer, New Grad"])
+        self.assertEqual(jobs[0]["company_name"], "Acme")
+        self.assertTrue(matches(jobs[0]))
+        self.assertEqual(sorted(board["_listed_ids"]),
+                         ["Data-Engineer_R-1", "Senior-Accountant_R-2", "Software-Engineer_R-3"])
+        self.assertEqual(len(calls), 2)  # one list call, one detail call
+
+    def test_first_poll_is_a_baseline_without_detail_calls(self):
+        board = {"provider": "bamboohr", "slug": "acme", "_baseline": True}
+        with patch("job_watcher.fetch_json", return_value={"result": [
+            {"id": "7", "jobOpeningName": "Software Engineer"},
+        ]}) as fetch:
+            self.assertEqual(job_watcher.fetch_bamboohr_board(board, now=int(time.time())), [])
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(board["_listed_ids"], ["7"])
+
+    def test_bamboohr_detail(self):
+        board = {"provider": "bamboohr", "slug": "acme"}
+
+        def fetch(url, data=None):
+            if url.endswith("/list"):
+                return {"result": [{"id": "7", "jobOpeningName": "Junior Data Analyst", "isRemote": True}]}
+            return {"result": {"jobOpening": {
+                "jobOpeningName": "Junior Data Analyst", "description": "<p>SQL</p>",
+                "location": {"city": "Austin", "state": "Texas", "addressCountry": "United States"},
+                "datePosted": TODAY, "jobOpeningShareUrl": "https://acme.bamboohr.com/careers/7"}}}
+
+        with patch("job_watcher.fetch_json", side_effect=fetch):
+            jobs = job_watcher.fetch_bamboohr_board(board, now=int(time.time()))
+        self.assertEqual(jobs[0]["locations"], ["Austin, Texas, United States", "Remote"])
+        self.assertTrue(matches(jobs[0]))
+
+    def test_rippling_detail_uses_company_name_and_role_text(self):
+        board = {"provider": "rippling", "slug": "acme"}
+
+        def fetch(url, data=None):
+            if url.endswith("/jobs"):
+                return [{"uuid": "u1", "name": "Software Engineer I", "workLocation": {"label": "Remote (US)"}}]
+            return {"name": "Software Engineer I", "companyName": "Acme Inc",
+                    "description": {"company": "<p>About</p>", "role": "<p>0-2 years</p>"},
+                    "workLocations": ["Remote (US)"], "createdOn": "2099-01-01T00:00:00-08:00",
+                    "url": "https://ats.rippling.com/acme/jobs/u1"}
+
+        with patch("job_watcher.fetch_json", side_effect=fetch):
+            jobs = job_watcher.fetch_rippling_board(board, now=int(time.time()))
+        self.assertEqual(jobs[0]["company_name"], "Acme Inc")
+        self.assertIn("0-2 years", jobs[0]["description"])
+
+    def test_oracle_detail(self):
+        board = {"provider": "oracle", "slug": "abcd.fa.us2.oraclecloud.com/CX_1"}
+
+        def fetch(url, data=None):
+            if "recruitingCEJobRequisitions?" in url:
+                return {"items": [{"requisitionList": [
+                    {"Id": "42", "Title": "Associate Software Engineer", "PostedDate": TODAY,
+                     "PrimaryLocation": "Dallas, TX, United States", "PrimaryLocationCountry": "US",
+                     "secondaryLocations": []},
+                    {"Id": "41", "Title": "Software Engineer", "PostedDate": "2020-01-01"},
+                ]}]}
+            self.assertIn("Id=%2242%22", url)
+            return {"items": [{"ExternalDescriptionStr": "<p>New grads welcome.</p>"}]}
+
+        with patch("job_watcher.fetch_json", side_effect=fetch):
+            jobs = job_watcher.fetch_oracle_board(board, now=int(time.time()))
+        self.assertEqual([job["id"] for job in jobs], ["oracle:abcd.fa.us2.oraclecloud.com/CX_1:42"])
+        self.assertEqual(
+            jobs[0]["url"], "https://abcd.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/42"
+        )
+
+    def test_jobvite_html(self):
+        board = {"provider": "jobvite", "slug": "acme"}
+        listing = ('<tr><td class="jv-job-list-name"> <a href="/acme/job/oAbC123">Junior Application Developer</a> '
+                   '</td> <td class="jv-job-list-location"> Washington, District Of Columbia </td></tr>')
+        detail = ('<div class="jv-job-detail-description"><p>Entry level role.</p></div>'
+                  '<div class="jv-job-detail-bottom-actions"></div>')
+        with patch("job_watcher.fetch_text", side_effect=lambda url: listing if url.endswith("/jobs") else detail):
+            jobs = job_watcher.fetch_jobvite_board(board, now=int(time.time()))
+        self.assertEqual(jobs[0]["url"], "https://jobs.jobvite.com/acme/job/oAbC123")
+        self.assertEqual(jobs[0]["description"], "Entry level role.")
+
+    def test_jazzhr_feed_uses_timestamp_in_id(self):
+        stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime(time.time() - 3600))
+        feed = f"""<jobs><company>Acme</company>
+            <job><id>job_{stamp}_ABC</id><status>Open</status><title>Software Engineer - Entry Level</title>
+            <url>https://acme.applytojob.com/apply/x/SE</url><city>Boston</city><state>MA</state>
+            <country>United States</country><description>&lt;p&gt;Hi&lt;/p&gt;</description></job>
+            <job><id>job_20200101000000_OLD</id><status>Open</status><title>Software Engineer</title></job>
+        </jobs>"""
+        with patch("job_watcher.fetch_text", return_value=feed):
+            jobs = job_watcher.fetch_jazzhr_board({"provider": "jazzhr", "slug": "acme"}, now=int(time.time()))
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["company_name"], "Acme")
+        self.assertTrue(matches(jobs[0]))
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_board_from_url(self):
+        cases = {
+            "https://job-boards.greenhouse.io/Acme/jobs/123": ("greenhouse", "acme"),
+            "https://boards.greenhouse.io/embed/job_app?for=acme&token=1": ("greenhouse", "acme"),
+            "https://jobs.lever.co/acme/uuid?lever-source=x": ("lever", "acme"),
+            "https://jobs.ashbyhq.com/Acme/uuid": ("ashby", "Acme"),
+            "https://pipersandler.wd501.myworkdayjobs.com/en-US/Piper_Sandler_Careers/job/X_R-1":
+                ("workday", "pipersandler.wd501.myworkdayjobs.com/pipersandler/Piper_Sandler_Careers"),
+            "https://wd5.myworkdaysite.com/en-US/recruiting/acme/External/job/X":
+                ("workday", "wd5.myworkdaysite.com/acme/External"),
+            "https://efds.fa.em5.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/74623":
+                ("oracle", "efds.fa.em5.oraclecloud.com/CX_1"),
+            "https://amii.bamboohr.com/careers/254/": ("bamboohr", "amii"),
+            "https://ataengineering.applytojob.com/apply/ivX/SE": ("jazzhr", "ataengineering"),
+            "https://jobs.jobvite.com/MetaPhase/job/oaR7Afws?nl=1": ("jobvite", "metaphase"),
+            "https://ats.rippling.com/en-GB/uplinq/jobs/db54": ("rippling", "uplinq"),
+            "https://jobs.smartrecruiters.com/AECOM2/123": ("smartrecruiters", "AECOM2"),
+            "https://apply.workable.com/accora/j/ABC/": ("workable", "accora"),
+        }
+        for url, (provider, slug) in cases.items():
+            with self.subTest(url=url):
+                board = job_watcher.board_from_url(url, "Acme")
+                self.assertEqual((board["provider"], board["slug"]), (provider, slug))
+        self.assertIsNone(job_watcher.board_from_url("https://careers.example.com/jobs/1"))
+
+    def test_harvest_adds_new_boards_once_and_skips_excluded(self):
+        now = int(time.time())
+        listings = [
+            {"category": "Software", "date_posted": now - 86400, "company_name": "Acme",
+             "url": "https://jobs.lever.co/acme/1"},
+            {"category": "AI/ML/Data", "date_posted": now - 86400, "company_name": "Acme",
+             "url": "https://jobs.lever.co/acme/2"},
+            {"category": "Hardware", "date_posted": now, "company_name": "Chips",
+             "url": "https://jobs.lever.co/chips/1"},
+            {"category": "Software", "date_posted": now - 400 * 86400, "company_name": "Old",
+             "url": "https://jobs.lever.co/old/1"},
+            {"category": "Software", "date_posted": now, "company_name": "Jane Street",
+             "url": "https://jobs.lever.co/janestreet/1"},
+            {"category": "Software", "date_posted": now, "company_name": "Known",
+             "url": "https://jobs.ashbyhq.com/known/1"},
+        ]
+        found = job_watcher.harvest_boards(listings, {"ashby:known"}, now)
+        self.assertEqual(found, [{"provider": "lever", "slug": "acme", "company": "Acme", "source": "simplify"}])
+
+    def test_simplify_listing_citizenship_is_enforced(self):
+        now = int(time.time())
+        jobs = job_watcher.simplify_jobs([
+            {"id": "a", "category": "Software", "date_posted": now - 600, "title": "Software Engineer, New Grad",
+             "company_name": "Acme", "locations": ["Austin, TX"], "url": "https://x/1", "active": True,
+             "sponsorship": "U.S. Citizenship is Required"},
+            {"id": "b", "category": "Software", "date_posted": now - 600, "title": "Software Engineer, New Grad",
+             "company_name": "Beta", "locations": ["Austin, TX"], "url": "https://x/2", "active": True,
+             "sponsorship": "Offers Sponsorship"},
+        ], now)
+        self.assertEqual([rejection_reason(job) for job in jobs], ["citizenship_requirement", "matched"])
+
+    def test_fetch_conditional_uses_etag_and_gzip(self):
+        import gzip, io
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE http_cache (url TEXT PRIMARY KEY, etag TEXT)")
+
+        class Response(io.BytesIO):
+            headers = {"Content-Encoding": "gzip", "ETag": '"v1"'}
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        with patch("job_watcher.urllib.request.urlopen", return_value=Response(gzip.compress(b"[1]"))):
+            self.assertEqual(job_watcher.fetch_conditional(connection, "https://x/l.json"), b"[1]")
+        seen = []
+
+        def not_modified(request, timeout):
+            seen.append(request.get_header("If-none-match"))
+            raise urllib.error.HTTPError("https://x/l.json", 304, "Not Modified", None, None)
+
+        with patch("job_watcher.urllib.request.urlopen", side_effect=not_modified):
+            self.assertIsNone(job_watcher.fetch_conditional(connection, "https://x/l.json"))
+        self.assertEqual(seen, ['"v1"'])
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import html
 import http.client
@@ -55,7 +56,7 @@ MAX_JOB_AGE_SECONDS = 24 * 60 * 60
 FUTURE_TIMESTAMP_GRACE_SECONDS = 5 * 60
 SUPPORTED_PROVIDERS = {
     "ashby", "greenhouse", "lever", "lever-eu", "recruitee", "smartrecruiters",
-    "workable",
+    "workable", "workday", "oracle", "bamboohr", "rippling", "jobvite", "jazzhr",
 }
 # --- Role filter --------------------------------------------------------------
 # Recall first: accept anything in the software / data / ML area and reject only
@@ -120,7 +121,7 @@ EXCLUDED_TITLE_RE = re.compile(
     r"account executive|experienced|expert|mid[- ]?level|iii|iv|v|vi|3|4|5|contractor|"
     r"part[- ]time|fixed[- ]term|temporary|temp|annotat\w*|tutor|raters?|speakers?|"
     r"contract (?:student|worker|role|position)|extern|externship|flexible hours|"
-    r"freelance|hourly)\b|\(contract\)|- contract\b"
+    r"freelance|hourly|summer|mba|seasonal)\b|\(contract\)|- contract\b"
 )
 TECHNICAL_STAFF_RE = re.compile(r"\b(?:member of (?:the )?)?technical staff\b")
 NEW_GRAD_TITLE_RE = re.compile(
@@ -161,6 +162,7 @@ US_STATE_CODES = (
     "MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|"
     "VT|VA|WA|WV|WI|WY|DC"
 )
+US_STATE_CODE_SET = set(US_STATE_CODES.split("|"))
 # Case-sensitive on purpose: "Remote in Canada" must not read as Indiana.
 US_STATE_CODE_RE = re.compile(rf",\s*(?:{US_STATE_CODES})\b")
 US_LOCATION_RE = re.compile(
@@ -325,7 +327,11 @@ def title_rejection(title: object) -> str | None:
 
 def is_us_location(locations: list[str]) -> bool:
     values = [re.sub(r"\s+", " ", str(value)).strip() for value in locations or []]
-    if any(US_STATE_CODE_RE.search(value) or US_LOCATION_RE.search(value) for value in values):
+    if any(
+        US_STATE_CODE_RE.search(value) or US_LOCATION_RE.search(value)
+        or value.strip(" .") in US_STATE_CODE_SET
+        for value in values
+    ):
         return True
     if any(NON_US_LOCATION_RE.search(value) for value in values):
         return False
@@ -410,6 +416,9 @@ def stable_id(job: dict) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+TRACKING_PARAMS = {"ref", "gh_src", "source", "src", "lever-source", "lever-origin"}
+
+
 def canonical_url(job: dict) -> str:
     raw_url = str(job.get("url", ""))
     if not raw_url:
@@ -419,7 +428,10 @@ def canonical_url(job: dict) -> str:
     if path.endswith("/application"):
         path = path.removesuffix("/application")
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    query = [(key, value) for key, value in query if not key.lower().startswith("utm_")]
+    query = [
+        (key, value) for key, value in query
+        if not key.lower().startswith("utm_") and key.lower() not in TRACKING_PARAMS
+    ]
     return urllib.parse.urlunsplit(
         (parsed.scheme.lower(), parsed.netloc.lower(), path, urllib.parse.urlencode(query), "")
     )
@@ -475,6 +487,9 @@ def connect_db() -> sqlite3.Connection:
         "rejections TEXT NOT NULL)"
     )
     connection.execute(
+        "CREATE TABLE IF NOT EXISTS http_cache (url TEXT PRIMARY KEY, etag TEXT)"
+    )
+    connection.execute(
         "CREATE TABLE IF NOT EXISTS observed_source_jobs ("
         "source TEXT NOT NULL, job_id TEXT NOT NULL, "
         "first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
@@ -483,13 +498,20 @@ def connect_db() -> sqlite3.Connection:
     return connection
 
 
+def loose_fingerprint(job: dict) -> str:
+    company = normalize_company(job.get("company_name"))
+    title = re.sub(r"[^a-z0-9]+", " ", str(job.get("title", "")).lower()).strip()
+    return hashlib.sha256(f"loose|{company}|{title}".encode()).hexdigest()
+
+
 def job_seen(connection: sqlite3.Connection, job: dict) -> bool:
     if connection.execute(
         "SELECT 1 FROM seen_jobs WHERE id = ?", (stable_id(job),)
     ).fetchone():
         return True
     if connection.execute(
-        "SELECT 1 FROM seen_fingerprints WHERE fingerprint = ?", (job_fingerprint(job),)
+        "SELECT 1 FROM seen_fingerprints WHERE fingerprint IN (?, ?)",
+        (job_fingerprint(job), loose_fingerprint(job)),
     ).fetchone():
         return True
     url = canonical_url(job)
@@ -509,7 +531,7 @@ def record_jobs(connection: sqlite3.Connection, jobs: list[dict]) -> None:
     )
     connection.executemany(
         "INSERT OR IGNORE INTO seen_fingerprints(fingerprint) VALUES (?)",
-        [(job_fingerprint(job),) for job in jobs],
+        [(fingerprint,) for job in jobs for fingerprint in (job_fingerprint(job), loose_fingerprint(job))],
     )
 
 
@@ -833,7 +855,7 @@ def direct_job(
         "board_key": board_key,
         "id": f"{board_key}:{job_id}",
         "title": title,
-        "company_name": company_from_slug(board["slug"]),
+        "company_name": board_company(board),
         "locations": [location for location in locations if location],
         "url": url,
         "description": description,
@@ -861,8 +883,10 @@ def fetch_json(url: str, data: bytes | None = None) -> object:
 
 
 def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
-    slug = urllib.parse.quote(board["slug"], safe="")
     provider = board["provider"]
+    if provider in CAREER_SITE_FETCHERS:
+        return board, CAREER_SITE_FETCHERS[provider](board, int(time.time()))
+    slug = urllib.parse.quote(board["slug"], safe="")
     normalized = []
     if provider == "greenhouse":
         payload = fetch_json(
@@ -1053,6 +1077,498 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
             job["company_name"] = str(payload.get("name") or company_from_slug(board["slug"]))
             normalized.append(job)
     return board, normalized
+
+
+# --- Career-site readers ----------------------------------------------------------
+# Workday, Oracle Recruiting, BambooHR, Rippling, JazzHR and Jobvite. Each reads the
+# same unauthenticated JSON, XML or HTML that the company's public careers page
+# loads. Readers marked DETAIL list cheaply, then fetch the full posting only for job
+# IDs they have not seen before and whose title passes the filter. The first poll of
+# a board just records the IDs that exist (the silent baseline) without fetching any
+# details.
+
+DETAIL_PROVIDERS = {"workday", "oracle", "bamboohr", "rippling", "jobvite"}
+MAX_DETAIL_FETCHES_PER_BOARD = 25
+WORKDAY_PAGE_SIZE = 20
+WORKDAY_MAX_PAGES = 5
+FRESH_DATE_SECONDS = 2 * 24 * 60 * 60
+
+
+def board_company(board: dict) -> str:
+    if board.get("company"):
+        return str(board["company"])
+    slug = str(board["slug"])
+    if "/" in slug:
+        parts = slug.split("/")
+        slug = parts[1] if board.get("provider") == "workday" and len(parts) > 2 else parts[0].split(".")[0]
+    return company_from_slug(slug)
+
+
+def detected_posted_at(value: object, now: int) -> int:
+    """A job first seen within two days of a date-only posting date was just posted."""
+    timestamp = parse_job_datetime(value)
+    if timestamp is None or now - timestamp <= FRESH_DATE_SECONDS:
+        return now
+    return timestamp
+
+
+def workday_posted_days(text: object) -> int:
+    value = str(text or "").lower()
+    if "today" in value or "just" in value:
+        return 0
+    if "yesterday" in value:
+        return 1
+    match = re.search(r"(\d+)", value)
+    return int(match.group(1)) if match else 99
+
+
+class DetailPlan:
+    """Bookkeeping for one board: which IDs were handled and which need details."""
+
+    def __init__(self, board: dict):
+        self.board = board
+        self.known = board.get("_known_ids") or frozenset()
+        self.baseline = bool(board.get("_baseline"))
+        self.handled: list[str] = []
+        self.fresh: list[tuple] = []
+
+    def consider(self, job_id: object, title: object, recent: bool = True, payload=None) -> None:
+        job_id = str(job_id)
+        if not job_id or job_id in self.known:
+            if job_id:
+                self.handled.append(job_id)
+            return
+        if self.baseline or not recent or title_rejection(title):
+            self.handled.append(job_id)
+            return
+        self.fresh.append((job_id, payload))
+
+    def details(self, fetch_one) -> list[dict]:
+        jobs = []
+        for job_id, payload in self.fresh[:MAX_DETAIL_FETCHES_PER_BOARD]:
+            try:
+                job = fetch_one(job_id, payload)
+            except Exception as exc:
+                print(f"Detail fetch failed board={self.board['provider']}:{self.board['slug']} "
+                      f"id={job_id} error={exc}", file=sys.stderr)
+                continue  # left unhandled, so it is retried next run
+            self.handled.append(job_id)
+            if job:
+                jobs.append(job)
+        self.board["_listed_ids"] = self.handled
+        return jobs
+
+
+def fetch_workday_board(board: dict, now: int) -> list[dict]:
+    host, tenant, site = str(board["slug"]).split("/", 2)
+    base = f"https://{host}/wday/cxs/{tenant}/{site}"
+    plan = DetailPlan(board)
+    for page in range(WORKDAY_MAX_PAGES):
+        payload = fetch_json(f"{base}/jobs", json.dumps({
+            "appliedFacets": {}, "limit": WORKDAY_PAGE_SIZE,
+            "offset": page * WORKDAY_PAGE_SIZE, "searchText": "",
+        }).encode())
+        postings = payload.get("jobPostings") or []
+        for posting in postings:
+            path = str(posting.get("externalPath") or "")
+            if path:
+                plan.consider(
+                    path.rstrip("/").rsplit("/", 1)[-1], posting.get("title"),
+                    workday_posted_days(posting.get("postedOn")) <= 1, (path, posting),
+                )
+        ages = [workday_posted_days(posting.get("postedOn")) for posting in postings]
+        if (not postings or min(ages) > 1 or plan.baseline
+                or (page + 1) * WORKDAY_PAGE_SIZE >= int(payload.get("total") or 0)):
+            break
+
+    def one(job_id, payload):
+        path, posting = payload
+        info = (fetch_json(base + path) or {}).get("jobPostingInfo") or {}
+        locations = [info.get("location") or posting.get("locationsText")]
+        locations += [str(value) for value in info.get("additionalLocations") or []]
+        locations.append((info.get("country") or {}).get("descriptor"))
+        return direct_job(
+            board, job_id, str(info.get("title") or posting.get("title") or ""),
+            [str(value) for value in locations if value],
+            str(info.get("externalUrl") or f"https://{host}/{site}{path}"),
+            plain_text(str(info.get("jobDescription") or "")),
+            detected_posted_at(info.get("startDate"), now),
+        )
+
+    return plan.details(one)
+
+
+def fetch_oracle_board(board: dict, now: int) -> list[dict]:
+    host, site = str(board["slug"]).split("/", 1)
+    api = f"https://{host}/hcmRestApi/resources/latest"
+    payload = fetch_json(
+        f"{api}/recruitingCEJobRequisitions?onlyData=true&expand=requisitionList.secondaryLocations"
+        f"&finder=findReqs;siteNumber={site},limit=50,sortBy=POSTING_DATES_DESC"
+    )
+    items = (payload.get("items") or [{}])[0].get("requisitionList") or []
+    plan = DetailPlan(board)
+    for item in items:
+        posted = parse_job_datetime(item.get("PostedDate"))
+        plan.consider(item.get("Id"), item.get("Title"),
+                      posted is None or now - posted <= FRESH_DATE_SECONDS, item)
+
+    def one(job_id, item):
+        detail = (fetch_json(
+            f"{api}/recruitingCEJobRequisitionDetails?expand=all&onlyData=true"
+            f"&finder=ById;Id=%22{urllib.parse.quote(job_id)}%22,siteNumber={site}"
+        ).get("items") or [{}])[0]
+        locations = [item.get("PrimaryLocation"), item.get("PrimaryLocationCountry")]
+        locations += [
+            value.get("Name") or value.get("LocationName") or ""
+            for value in item.get("secondaryLocations") or [] if isinstance(value, dict)
+        ]
+        description = " ".join(plain_text(str(detail.get(key) or "")) for key in (
+            "ExternalDescriptionStr", "ExternalResponsibilitiesStr", "ExternalQualificationsStr",
+        ))
+        return direct_job(
+            board, job_id, str(item.get("Title") or ""),
+            [str(value) for value in locations if value],
+            f"https://{host}/hcmUI/CandidateExperience/en/sites/{site}/job/{job_id}",
+            description or plain_text(str(item.get("ShortDescriptionStr") or "")),
+            detected_posted_at(item.get("PostedDate"), now),
+        )
+
+    return plan.details(one)
+
+
+def fetch_bamboohr_board(board: dict, now: int) -> list[dict]:
+    base = f'https://{board["slug"]}.bamboohr.com/careers'
+    plan = DetailPlan(board)
+    for item in fetch_json(f"{base}/list").get("result") or []:
+        plan.consider(item.get("id"), item.get("jobOpeningName"), True, item)
+
+    def one(job_id, item):
+        opening = (fetch_json(f"{base}/{job_id}/detail").get("result") or {}).get("jobOpening") or {}
+        location = opening.get("location") or {}
+        ats = opening.get("atsLocation") or {}
+        locations = [
+            ", ".join(filter(None, [location.get("city"), location.get("state"), location.get("addressCountry")])),
+            ", ".join(filter(None, [ats.get("city"), ats.get("state"), ats.get("country")])),
+        ]
+        if item.get("isRemote"):
+            locations.append("Remote")
+        return direct_job(
+            board, job_id, str(opening.get("jobOpeningName") or item.get("jobOpeningName") or ""),
+            [value for value in locations if value],
+            str(opening.get("jobOpeningShareUrl") or f"{base}/{job_id}"),
+            " ".join(filter(None, [
+                str(opening.get("minimumExperience") or ""),
+                plain_text(str(opening.get("description") or "")),
+            ])),
+            detected_posted_at(opening.get("datePosted"), now),
+        )
+
+    return plan.details(one)
+
+
+def fetch_rippling_board(board: dict, now: int) -> list[dict]:
+    base = f'https://api.rippling.com/platform/api/ats/v1/board/{urllib.parse.quote(str(board["slug"]))}/jobs'
+    plan = DetailPlan(board)
+    for item in fetch_json(base) or []:
+        plan.consider(item.get("uuid"), item.get("name"), True, item)
+
+    def one(job_id, item):
+        detail = fetch_json(f"{base}/{job_id}") or {}
+        description = detail.get("description") or ""
+        if isinstance(description, dict):
+            description = " ".join(str(value or "") for value in description.values())
+        locations = [str(value) for value in detail.get("workLocations") or []]
+        locations.append(str((item.get("workLocation") or {}).get("label") or ""))
+        job = direct_job(
+            board, job_id, str(detail.get("name") or item.get("name") or ""),
+            [value for value in locations if value],
+            str(detail.get("url") or item.get("url") or ""),
+            plain_text(str(description)),
+            detected_posted_at(detail.get("createdOn"), now),
+        )
+        if detail.get("companyName") and not board.get("company"):
+            job["company_name"] = str(detail["companyName"])
+        return job
+
+    return plan.details(one)
+
+
+JOBVITE_ROW_RE = re.compile(
+    r'<a href="(/[^"/]+/job/([^"/?#]+))[^"]*"[^>]*>(.*?)</a>\s*</td>\s*'
+    r'(?:<td class="jv-job-list-location">(.*?)</td>)?',
+    re.S,
+)
+
+
+def fetch_jobvite_board(board: dict, now: int) -> list[dict]:
+    slug = urllib.parse.quote(str(board["slug"]))
+    page = fetch_text(f"https://jobs.jobvite.com/{slug}/jobs")
+    plan = DetailPlan(board)
+    for path, job_id, title, location in JOBVITE_ROW_RE.findall(page):
+        plan.consider(job_id, plain_text(title), True, (path, plain_text(title), plain_text(location or "")))
+
+    def one(job_id, payload):
+        path, title, location = payload
+        detail = fetch_text(f"https://jobs.jobvite.com{path}")
+        match = re.search(r'<div class="jv-job-detail-description"[^>]*>(.*?)<div class="jv-job-detail-bottom', detail, re.S)
+        return direct_job(
+            board, job_id, title, [location],
+            f"https://jobs.jobvite.com{path}",
+            plain_text(match.group(1) if match else detail),
+            now,  # Jobvite publishes no date; first seen is the best signal
+        )
+
+    return plan.details(one)
+
+
+def fetch_jazzhr_board(board: dict, now: int) -> list[dict]:
+    feed = fetch_text(f'https://app.jazz.co/feeds/export/jobs/{urllib.parse.quote(str(board["slug"]))}')
+    root = ET.fromstring(feed.encode())
+    company = (root.findtext("company") or "").strip()
+    jobs = []
+    for item in root.iter("job"):
+        if (item.findtext("status") or "Open").strip().lower() != "open":
+            continue
+        job_id = (item.findtext("id") or "").strip()
+        stamp = re.search(r"job_(\d{14})_", job_id)
+        posted = (
+            datetime.strptime(stamp.group(1), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).isoformat()
+            if stamp else None
+        )
+        if not source_timestamp_is_recent(posted, now):
+            continue
+        location = ", ".join(filter(None, [
+            (item.findtext(tag) or "").strip() for tag in ("city", "state", "country")
+        ]))
+        job = direct_job(
+            board, job_id, (item.findtext("title") or "").strip(), [location],
+            (item.findtext("url") or "").strip(),
+            " ".join(filter(None, [
+                (item.findtext("experience") or "").strip(),
+                plain_text(item.findtext("description") or ""),
+            ])),
+            posted,
+        )
+        if company and not board.get("company"):
+            job["company_name"] = company
+        jobs.append(job)
+    return jobs
+
+
+CAREER_SITE_FETCHERS = {
+    "workday": fetch_workday_board,
+    "oracle": fetch_oracle_board,
+    "bamboohr": fetch_bamboohr_board,
+    "rippling": fetch_rippling_board,
+    "jobvite": fetch_jobvite_board,
+    "jazzhr": fetch_jazzhr_board,
+}
+
+
+def prepare_detail_boards(connection: sqlite3.Connection, boards: list[dict]) -> list[dict]:
+    """Attach known job IDs and baseline status to boards read through DetailPlan."""
+    initialized = {row[0] for row in connection.execute("SELECT board_key FROM initialized_boards")}
+    prepared = []
+    for board in boards:
+        if board.get("provider") not in DETAIL_PROVIDERS:
+            prepared.append(board)
+            continue
+        key = f'{board["provider"]}:{board["slug"]}'
+        known = frozenset(row[0] for row in connection.execute(
+            "SELECT job_id FROM observed_source_jobs WHERE source = ?", (key,)
+        ))
+        prepared.append({**board, "_known_ids": known, "_baseline": key not in initialized})
+    return prepared
+
+
+def remember_listed_ids(connection: sqlite3.Connection, board: dict) -> None:
+    ids = board.get("_listed_ids")
+    if ids:
+        key = f'{board["provider"]}:{board["slug"]}'
+        connection.executemany(
+            "INSERT OR IGNORE INTO observed_source_jobs(source, job_id) VALUES (?, ?)",
+            [(key, job_id) for job_id in ids],
+        )
+
+
+# --- Board discovery ------------------------------------------------------------------
+# SimplifyJobs publishes its curated new-grad and internship lists as JSON. Every apply
+# link names a company's ATS board, so the lists double as a directory of companies
+# that hire new grads. New boards are added to state/ats_boards.json once a day, and
+# fresh new-grad listings are also used as a backstop source for roles on ATSes the
+# watcher can't read (iCIMS, custom career sites).
+
+SIMPLIFY_LISTINGS = {
+    "simplify-newgrad": "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
+    "simplify-interns": "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json",
+}
+SIMPLIFY_INTERVALS = {"simplify-newgrad": 15 * 60, "simplify-interns": 24 * 60 * 60}
+HARVEST_CATEGORIES = {
+    "Software", "AI/ML/Data", "Software Engineering", "Data Science, AI & Machine Learning",
+}
+HARVEST_MAX_AGE_SECONDS = 365 * 24 * 60 * 60
+LOCALE_SEGMENT_RE = re.compile(r"^[a-z]{2}(?:-[A-Za-z]{2})?$")
+SIMPLIFY_CITIZENSHIP = "U.S. Citizenship is Required"
+
+
+def board_from_url(url: str, company: str = "") -> dict | None:
+    parts = urllib.parse.urlsplit(str(url or ""))
+    host = parts.netloc.lower().split(":")[0]
+    path = [segment for segment in parts.path.split("/") if segment]
+    query = urllib.parse.parse_qs(parts.query)
+    board = None
+    if host.endswith("greenhouse.io"):
+        slug = (query.get("for") or [None])[0] if path[:1] == ["embed"] else (path[0] if path else None)
+        board = slug and {"provider": "greenhouse", "slug": slug.lower()}
+    elif host in {"jobs.lever.co", "jobs.eu.lever.co"} and path:
+        board = {"provider": "lever-eu" if ".eu." in host else "lever", "slug": path[0].lower()}
+    elif host == "jobs.ashbyhq.com" and path:
+        board = {"provider": "ashby", "slug": path[0]}
+    elif host in {"jobs.smartrecruiters.com", "careers.smartrecruiters.com"} and path:
+        board = {"provider": "smartrecruiters", "slug": path[0]}
+    elif host == "apply.workable.com" and path and path[0] != "j":
+        board = {"provider": "workable", "slug": path[0].lower()}
+    elif host.endswith(".myworkdayjobs.com"):
+        segments = [segment for segment in path if not LOCALE_SEGMENT_RE.match(segment)]
+        if segments and segments[0] != "wday":
+            board = {"provider": "workday", "slug": f"{host}/{host.split('.')[0]}/{segments[0]}"}
+    elif host.endswith(".myworkdaysite.com") and "recruiting" in path:
+        index = path.index("recruiting")
+        if len(path) > index + 2:
+            board = {"provider": "workday", "slug": f"{host}/{path[index + 1]}/{path[index + 2]}"}
+    elif host.endswith("oraclecloud.com") and "sites" in path:
+        index = path.index("sites")
+        if len(path) > index + 1:
+            board = {"provider": "oracle", "slug": f"{host}/{path[index + 1]}"}
+    elif host.endswith(".bamboohr.com") and host.count(".") == 2:
+        board = {"provider": "bamboohr", "slug": host.split(".")[0]}
+    elif host.endswith(".applytojob.com"):
+        board = {"provider": "jazzhr", "slug": host.split(".")[0]}
+    elif host == "jobs.jobvite.com" and path:
+        board = {"provider": "jobvite", "slug": path[0].lower()}
+    elif host == "ats.rippling.com" and path:
+        segments = [segment for segment in path if not LOCALE_SEGMENT_RE.match(segment)]
+        board = segments and {"provider": "rippling", "slug": segments[0]}
+    elif host.endswith(".recruitee.com"):
+        board = {"provider": "recruitee", "slug": host.split(".")[0]}
+    if not board:
+        return None
+    if company:
+        board["company"] = company
+    return board
+
+
+def registry_key(board: dict) -> str:
+    return f'{board.get("provider")}:{str(board.get("slug", "")).lower()}'
+
+
+def write_registry(boards: list[dict], registry_path: Path) -> None:
+    temporary = registry_path.with_name(f".{registry_path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(boards, indent=2) + "\n")
+    os.replace(temporary, registry_path)
+
+
+def harvest_boards(listings: list[dict], known_keys: set[str], now: int) -> list[dict]:
+    found = []
+    for listing in listings:
+        if listing.get("category") not in HARVEST_CATEGORIES:
+            continue
+        if now - int(listing.get("date_posted") or 0) > HARVEST_MAX_AGE_SECONDS:
+            continue
+        company = str(listing.get("company_name") or "").strip()
+        if normalize_company(company) in EXCLUDED_COMPANIES:
+            continue
+        board = board_from_url(listing.get("url", ""), company)
+        if not board or board["provider"] not in SUPPORTED_PROVIDERS:
+            continue
+        key = registry_key(board)
+        if key not in known_keys:
+            known_keys.add(key)
+            found.append({**board, "source": "simplify"})
+    return found
+
+
+def simplify_jobs(listings: list[dict], now: int) -> list[dict]:
+    jobs = []
+    for listing in listings:
+        posted = int(listing.get("date_posted") or 0)
+        if listing.get("category") not in HARVEST_CATEGORIES or now - posted > MAX_JOB_AGE_SECONDS:
+            continue
+        jobs.append({
+            "source": "simplify",
+            "id": f'simplify:{listing.get("id")}',
+            "title": str(listing.get("title") or ""),
+            "company_name": str(listing.get("company_name") or ""),
+            "locations": [str(value) for value in listing.get("locations") or []],
+            "url": str(listing.get("url") or ""),
+            "description": (
+                "U.S. citizenship is required." if listing.get("sponsorship") == SIMPLIFY_CITIZENSHIP else ""
+            ),
+            "posted_at": posted,
+            "active": bool(listing.get("active", True)),
+            "is_visible": bool(listing.get("is_visible", True)),
+        })
+    return jobs
+
+
+def fetch_conditional(connection: sqlite3.Connection, url: str) -> bytes | None:
+    """GET with If-None-Match and gzip; None when the file has not changed."""
+    row = connection.execute("SELECT etag FROM http_cache WHERE url = ?", (url,)).fetchone()
+    headers = {"User-Agent": "personal-new-grad-job-watcher/1.0", "Accept-Encoding": "gzip"}
+    if row and row[0]:
+        headers["If-None-Match"] = row[0]
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as response:
+            body = response.read()
+            if response.headers.get("Content-Encoding") == "gzip":
+                body = gzip.decompress(body)
+            etag = response.headers.get("ETag")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return None
+        raise
+    connection.execute(
+        "INSERT INTO http_cache(url, etag) VALUES (?, ?) "
+        "ON CONFLICT(url) DO UPDATE SET etag=excluded.etag",
+        (url, etag),
+    )
+    return body
+
+
+def fetch_simplify(
+    connection: sqlite3.Connection, boards: list[dict], now: int, registry_path: Path
+) -> list[tuple[str, list[dict]]]:
+    last_checks = dict(connection.execute("SELECT source, last_checked FROM source_checks"))
+    known = {registry_key(board) for board in boards}
+    new_boards: list[dict] = []
+    results = []
+    for name, url in SIMPLIFY_LISTINGS.items():
+        if now - int(last_checks.get(name, 0)) < SIMPLIFY_INTERVALS[name]:
+            continue
+        try:
+            body = fetch_conditional(connection, url)
+            if body is not None:
+                listings = json.loads(body)
+                new_boards += harvest_boards(listings, known, now)
+                if name == "simplify-newgrad":
+                    results.append(("simplify", simplify_jobs(listings, now)))
+        except Exception as exc:
+            print(f"Simplify source failed ({name}): {exc}", file=sys.stderr)
+        finally:
+            connection.execute(
+                "INSERT INTO source_checks(source, last_checked) VALUES (?, ?) "
+                "ON CONFLICT(source) DO UPDATE SET last_checked=excluded.last_checked",
+                (name, now),
+            )
+    if new_boards:
+        source = registry_path if registry_path.exists() else BOOTSTRAP_BOARDS_PATH
+        current = json.loads(source.read_text()) if source.exists() else []
+        write_registry(current + new_boards, registry_path)
+        counts = Counter(board["provider"] for board in new_boards)
+        print(f"Harvested {len(new_boards)} new boards: " + ", ".join(
+            f"{provider} {count}" for provider, count in counts.most_common()
+        ))
+    return results
 
 
 def fetch_text(url: str) -> str:
@@ -1330,6 +1846,8 @@ def fetch_direct_batch(
 def find_migrated_board(board: dict, fetch=None) -> dict | None:
     """Return the same slug on another ATS if it has listed jobs there."""
     fetch = fetch or fetch_json
+    if "/" in str(board["slug"]):
+        return None
     old_key = f'{board["provider"]}:{board["slug"]}'
     family = "lever" if board["provider"].startswith("lever") else board["provider"]
     slug = urllib.parse.quote(board["slug"], safe="")
@@ -2154,7 +2672,9 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 0
-        due_boards = select_due_boards(connection, boards, checked_at)
+        due_boards = prepare_detail_boards(
+            connection, select_due_boards(connection, boards, checked_at)
+        )
         direct_results, failed_boards = fetch_direct_batch(due_boards)
         missing_boards = [
             board for board, exc in failed_boards if is_missing_board_error(exc)
@@ -2177,6 +2697,7 @@ def main() -> int:
             aggregator_results, feed_results, failed_feeds = [], [], []
         else:
             aggregator_results = fetch_due_aggregators(connection, checked_at)
+            aggregator_results += fetch_simplify(connection, boards, checked_at, BOARDS_PATH)
             feed_results, failed_feeds = fetch_due_feeds(connection, feeds, checked_at)
         candidates = []
         initialized_count = 0
@@ -2192,6 +2713,7 @@ def main() -> int:
             record_board_success(
                 connection, board, relevant_count, match_count, checked_at
             )
+            remember_listed_ids(connection, board)
             new_candidates, was_initialized = source_candidates(
                 connection, board_key, direct_jobs
             )
