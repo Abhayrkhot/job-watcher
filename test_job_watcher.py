@@ -900,6 +900,16 @@ class CareerSiteTests(unittest.TestCase):
                          ["Data-Engineer_R-1", "Senior-Accountant_R-2", "Software-Engineer_R-3"])
         self.assertEqual(len(calls), 2)  # one list call, one detail call
 
+    def test_workday_pacing_widens_after_a_429(self):
+        job_watcher._workday_throttled.clear()
+        job_watcher._workday_next_slot.clear()
+        with patch("job_watcher.fetch_json", side_effect=http_error(429)), \
+                patch("job_watcher.time.sleep"):
+            with self.assertRaises(urllib.error.HTTPError):
+                job_watcher.workday_fetch("https://acme.wd3.myworkdayjobs.com/wday/cxs/acme/C/jobs")
+        self.assertIn("wd3.myworkdayjobs.com", job_watcher._workday_throttled)
+        self.assertTrue(job_watcher.is_transient_http_error(http_error(429)))
+
     def test_first_poll_is_a_baseline_without_detail_calls(self):
         board = {"provider": "bamboohr", "slug": "acme", "_baseline": True}
         with patch("job_watcher.fetch_json", return_value={"result": [

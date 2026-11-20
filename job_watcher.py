@@ -1136,20 +1136,35 @@ class DetailPlan:
         return jobs
 
 
-WORKDAY_SLOTS = threading.BoundedSemaphore(3)  # tenants share hosts that throttle
+WORKDAY_SLOTS = threading.BoundedSemaphore(3)
+WORKDAY_HOST_SPACING_SECONDS = 0.25
+WORKDAY_THROTTLED_SPACING_SECONDS = 1.5
+_workday_lock = threading.Lock()
+_workday_next_slot: dict[str, float] = {}
+_workday_throttled: set[str] = set()
 
 
 def workday_fetch(url: str, data: bytes | None = None) -> object:
-    for attempt in range(2):
-        with WORKDAY_SLOTS:
-            try:
-                return fetch_json(url, data)
-            except urllib.error.HTTPError as exc:
-                if exc.code != 429 or attempt:
-                    raise
-                retry_after = exc.headers.get("Retry-After") if exc.headers else None
-        time.sleep(min(float(retry_after) if retry_after and retry_after.isdigit() else 3.0, 10.0))
-    return {}
+    """Pace requests per Workday host (tenants share hosts; wd3 throttles hardest).
+    A 429 widens that host's spacing for the rest of the run; the board itself is
+    marked transient and polled again later."""
+    host = urllib.parse.urlsplit(url).netloc.split(".", 1)[-1]
+    with _workday_lock:
+        spacing = (WORKDAY_THROTTLED_SPACING_SECONDS if host in _workday_throttled
+                   else WORKDAY_HOST_SPACING_SECONDS)
+        now = time.monotonic()
+        start = max(now, _workday_next_slot.get(host, 0.0))
+        _workday_next_slot[host] = start + spacing
+    if start > now:
+        time.sleep(start - now)
+    with WORKDAY_SLOTS:
+        try:
+            return fetch_json(url, data)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                with _workday_lock:
+                    _workday_throttled.add(host)
+            raise
 
 
 def fetch_workday_board(board: dict, now: int) -> list[dict]:
