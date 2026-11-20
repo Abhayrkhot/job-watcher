@@ -16,15 +16,26 @@ disqualifiers:
   contract, part-time, temporary, and annotation work. Words are matched whole,
   so "Internal Tools" is not an internship.
 - **Role family**: engineer and developer titles need a software, data, or ML word
-  ("Software Development Engineer 1", "Forward Deployed Engineer"). Analyst,
-  associate, and scientist titles need a data or ML word next to them. Hardware,
-  mechanical, and manufacturing titles are dropped unless they also say software.
-- **Experience**: rejected only when a hard requirement asks for 3+ years, or for
-  2+ years with no new-grad signal. "Or a Master's", "degree or 4 years",
-  "including internships", and "is a plus" don't count as requirements, and
-  numbers that aren't about experience ("20-40 years behind") are ignored.
-- **Location**: at least one US location, or only "Remote"/"Hybrid". A role open
-  in both the US and Canada is kept.
+  ("Software Development Engineer 1", "Forward Deployed Engineer"). Analyst and
+  associate titles must be directly data- or analytics-qualified ("Data Analyst",
+  "Analyst, Data Systems", "Data Associate"), so "Facility Analyst" and "Business
+  Analyst, Finance" are dropped. Lab, pharma, and humanities scientist titles need
+  an ML or computational word. Hardware, controls, lithography, R&D product
+  development, wireless, and manufacturing titles are dropped unless they also say
+  software, as are AVP, post-doc, administrator, and coordinator titles.
+- **Experience**: the strictest hard requirement counts. "3+ years building ..."
+  is a requirement even without the word "experience". A posting is rejected for
+  3+ years, or for 2+ years without a new-grad title; "2-3 years" counts as a
+  junior band. In tiered wording ("BS + 6 years or MS + 5 years or PhD") the
+  Master's path is the one that counts. "Degree or 4 years", "including
+  internships", and anything under a "Preferred", "Nice to have", or
+  "Considerations for top candidates" header don't count. "Mid-level", "several
+  years", "proven track record", and "deep expertise in ..." reject.
+- **Location**: US only. The posting needs a US city, state, or "United States"
+  in its location. A bare "Remote" or blank location is kept only when the
+  description itself says US (for example "authorized to work in the U.S." or US
+  time zones). A role open in both the US and Canada is kept; country codes such
+  as "IN" or "IND" next to an Indian city are not read as US states.
 - **Work authorization**: rejected when it requires U.S. citizenship, permanent
   residency, U.S.-person status, or a security clearance. Equal-opportunity text
   about "citizenship status" is not a requirement.
@@ -116,7 +127,10 @@ feed as US-only:
 ```
 
 Alert emails are grouped by ML, AI, data science, data, SDE, robotics, and other,
-then sorted by posting time. A daily health email reports sources checked, jobs
+then sorted by posting time. The Posted column shows when the company posted the
+job ("2h ago · Nov 19, 10:04 PM ET"), or just the date when the source only
+publishes a date (Workday, Oracle, BambooHR). Jobvite publishes no date, so those
+rows say "Not published" with the time the watcher first saw the job. A daily health email reports sources checked, jobs
 inspected, matches, notifications, failures, and exact filter rejection totals.
 Run `./run.sh --health-report` to request it immediately.
 

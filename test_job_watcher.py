@@ -180,6 +180,27 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(relative_posted_time({"posted_at": 100000 - (3 * 60 * 60)}), "3h ago")
         self.assertEqual(relative_posted_time({}), "Unknown")
 
+    def test_posted_label_shows_when_the_company_posted(self):
+        now = int(datetime(2026, 11, 20, 6, 0, tzinfo=timezone.utc).timestamp())
+        posted = int(datetime(2026, 11, 20, 3, 4, tzinfo=timezone.utc).timestamp())
+        self.assertEqual(job_watcher.posted_label({"posted_at": posted}, now), "2h ago · Nov 19, 10:04 PM ET")
+        self.assertEqual(job_watcher.posted_label(
+            {"posted_at": "2026-11-19", "posted_precision": "date", "detected_at": now}, now), "Nov 19")
+        self.assertEqual(job_watcher.posted_label(
+            {"posted_at": None, "posted_precision": "unknown", "detected_at": now - 120}, now),
+            "Not published (seen 2m ago)")
+        self.assertTrue(job_watcher.posted_label(
+            {"posted_at": posted, "posted_precision": "listed"}, now).startswith("Listed 2h ago on Simplify"))
+
+    def test_date_only_posting_stays_fresh_by_detection_time(self):
+        now = int(time.time())
+        yesterday = time.strftime("%Y-%m-%d", time.gmtime(now - 86400 - 7200))
+        job = job_watcher.with_posting(self.job("Software Engineer - New Grad"), yesterday, now)
+        self.assertEqual(job["posted_at"], yesterday)
+        self.assertEqual(rejection_reason(job), "matched")
+        stale = job_watcher.with_posting(self.job("Software Engineer - New Grad"), "2020-01-01", now)
+        self.assertEqual(rejection_reason(stale), "outside_24_hours")
+
     @patch("job_watcher.fetch_json")
     def test_smartrecruiters_normalization(self, fetch_json):
         fetch_json.side_effect = [
@@ -288,7 +309,9 @@ class MatchTests(unittest.TestCase):
         )
         self.assertFalse(initialized)
         self.assertEqual([job["id"] for job in candidates], ["workable:acme:new"])
-        self.assertEqual(candidates[0]["posted_display"], "Newly detected")
+        # The real posting time is kept for display; first-seen time drives freshness.
+        self.assertEqual(candidates[0]["posted_at"], 1)
+        self.assertIn("detected_at", candidates[0])
 
     @patch("job_watcher.fetch_text")
     def test_approved_feed_normalization_does_not_assume_us(self, fetch_text):
@@ -564,17 +587,85 @@ class FilterRecallTests(unittest.TestCase):
         )), "matched")
 
     def test_location_rules(self):
-        self.assertEqual(rejection_reason(self.job("Software Engineer", locations=["Remote"])), "matched")
-        self.assertEqual(rejection_reason(self.job("Software Engineer", locations=[])), "matched")
+        us_remote = "Remote role; you must be authorized to work in the United States."
+        self.assertEqual(rejection_reason(self.job("Software Engineer", us_remote, locations=["Remote"])), "matched")
+        self.assertEqual(rejection_reason(self.job("Software Engineer", us_remote, locations=[])), "matched")
+        # Bare "Remote" with nothing saying US is not enough.
+        self.assertEqual(rejection_reason(self.job("Software Engineer", locations=["Remote"])), "outside_us")
         self.assertEqual(rejection_reason(self.job("Software Engineer", locations=["LA"])), "matched")
         self.assertEqual(rejection_reason(self.job(
             "Software Engineer", locations=["Remote - US", "Remote - Canada"]
         )), "matched")
-        for locations in (["London, UK"], ["Remote in Canada"], ["Bengaluru, India"]):
+        for locations in (["London, UK"], ["Remote in Canada"], ["Bengaluru, India"],
+                          ["Noida, Uttar Pradesh, India", "IN"], ["IND - Pune"], ["Gurugram, Haryana"]):
             with self.subTest(locations=locations):
                 self.assertEqual(
                     rejection_reason(self.job("Software Engineer", locations=locations)), "outside_us"
                 )
+
+    def test_review_of_emailed_jobs_2026_11_20(self):
+        rejected = {
+            "Department Administrator, Software Engineering": "excluded_seniority_or_internship",
+            "Software Engineer AVP": "excluded_seniority_or_internship",
+            "Associate Scientist, Post Doc Fellow- Computational Pathology": "excluded_seniority_or_internship",
+            "Drug Development Data Scientist": "outside_role_families",
+            "Research Scientist - Arts, Humanities, and Ethics": "outside_role_families",
+            "Research Scientist - Bioanalytical LCMS Research and Development": "outside_role_families",
+            "Facility Analyst - Strategy Data & Analytics": "outside_role_families",
+            "Business Analyst, Finance AI & Digital Solutions": "outside_role_families",
+            "Strategic Technology Analyst, Vendor Solutions": "outside_role_families",
+            "Product Development Engineer - R&D": "outside_role_families",
+            "Lithography System Performance Engineer - Defectivity": "outside_role_families",
+            "Product Change Control Engineer": "outside_role_families",
+            "Controls/Automation Engineer": "outside_role_families",
+            "Solutions Engineer, Wireless - NJ, Remote": "outside_role_families",
+        }
+        for title, reason in rejected.items():
+            with self.subTest(title=title):
+                self.assertEqual(rejection_reason(self.job(title)), reason)
+        for title in [
+            "Associate Applied ML Scientist - 1087",
+            "Machine Learning Research Scientist, Open-Endedness",
+            "AI Scientist, Computational Protein Design",
+            "Analyst, Data Systems and Automation (2027 New College Graduate)",
+            "Pricing Analytics Analyst",
+            "2027 Advance Program Data Associate (DC)",
+            "Systems / Software Engineer I Graduate",
+            "Embedded Software Engineering Specialist",
+        ]:
+            with self.subTest(title=title):
+                self.assertEqual(rejection_reason(self.job(title)), "matched")
+
+    def test_stricter_experience_rules(self):
+        too_much = [
+            # the strictest requirement counts, not the smallest
+            "At least one year using AI coding assistants. 6+ years of professional .NET development experience.",
+            # "N+ years <doing something>" is a requirement without the word "experience"
+            "3+ years building and operating distributed systems.",
+            # tiered requirements: the Master's path applies
+            "Bachelor's Degree and 6 years of experience OR Master's Degree and 5 years of experience OR PhD and 0 years of experience.",
+            "BS in Electrical Engineering with 10+ years of relevant industry experience OR MS with 8+ years.",
+            # sections run together without periods
+            "Basic Qualifications: Bachelor's Degree At least 2 years of experience with integrations Preferred Qualifications: Master's degree",
+            "We are seeking a mid-level Data Platform Engineer.",
+            "You have several years of experience shipping consumer software.",
+        ]
+        for description in too_much:
+            with self.subTest(description=description):
+                self.assertEqual(rejection_reason(self.job("Software Engineer", description)), "too_much_experience")
+        fine = [
+            "Bachelor's degree with 4+ years of relevant experience, or Master's degree with 1+ years.",
+            "2-3 years of professional software experience.",
+            "With our global scale and deep expertise, you'll grow your career.",
+            "Considerations For Top Candidates: Extensive experience designing embedded software in C++.",
+            "Preferred Qualifications: 5+ years of Java experience.",
+        ]
+        for description in fine:
+            with self.subTest(description=description):
+                self.assertEqual(rejection_reason(self.job("Software Engineer", description)), "matched")
+        self.assertEqual(rejection_reason(self.job(
+            "Full-Stack Software Engineer (New Grad)", "Our founders bring 12+ years in construction tech."
+        )), "matched")
 
     def test_citizenship_rules(self):
         eeo = ("We consider all applicants without regard to race, religion, national origin, "

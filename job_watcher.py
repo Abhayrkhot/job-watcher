@@ -105,7 +105,8 @@ DOMAIN_RE = re.compile(
     r"technology)\b"
 )
 HARDWARE_RE = re.compile(
-    r"\b(?:mechanical|civil|structural|electrical|electronics?|hardware|"
+    r"\b(?:lithography|semiconductor|wafer|metrology|defectivity|controls?|change control|"
+    r"product development|r&d|wireless|lab|laboratory|mechanical|civil|structural|electrical|electronics?|hardware|"
     r"manufacturing|process|chemical|rf|analog|mixed[- ]signal|asic|fpga|soc|"
     r"silicon|vlsi|layout|pcb|packaging|materials|industrial|environmental|"
     r"facilities|facility|physical|construction|field|propulsion|avionics|thermal|optical|optics|"
@@ -126,7 +127,35 @@ EXCLUDED_TITLE_RE = re.compile(
     r"account executive|experienced|expert|mid[- ]?level|iii|iv|v|vi|3|4|5|contractor|"
     r"part[- ]time|fixed[- ]term|temporary|temp|annotat\w*|tutor|raters?|speakers?|"
     r"contract (?:student|worker|role|position)|extern|externship|flexible hours|"
+    r"avp|svp|evp|assistant vice president|post doc|administrator|coordinator|assistant|"
     r"freelance|hourly|summer|mba|seasonal)\b|\(contract\)|- contract\b"
+)
+ANALYST_DIRECT_RE = re.compile(
+    r"\b(?:data|analytics|bi|business intelligence|quantitative|quant|statistical|insights|"
+    r"data science|machine learning|ml)\s+(?:\w+\s+)?analysts?\b"
+)
+ANALYST_TRAILING_RE = re.compile(
+    r"\banalysts?\s*[,\-–:(/]\s*(?:[\w&\-]+\s+){0,4}?"
+    r"(?:data|analytics|full[- ]?stack|software|machine learning)\b"
+)
+ASSOCIATE_DIRECT_RE = re.compile(r"\b(?:software|data|engineering|analytics|technology)\s+associates?\b")
+BUSINESS_RE = re.compile(
+    r"\b(?:facility|facilities|finance|financial|vendor|procurement|strategy|strategic|"
+    r"business|marketing|operations|sales|compliance|risk|audit|accounting|tax|hr|"
+    r"human resources|real estate|supply chain|legal|privacy)\b"
+)
+SCIENCE_DOMAIN_RE = re.compile(
+    r"\b(?:data|machine learning|ml|ai|artificial intelligence|deep learning|nlp|"
+    r"computer vision|vision|robotics|computational|applied|decision|research|quantitative)\b"
+)
+NON_TECH_SCIENCE_RE = re.compile(
+    r"\b(?:bio\w*|chem\w*|pharma\w*|drug|clinical|lab|laboratory|lcms|assay|humanities|"
+    r"arts|ethics|social|psych\w*|materials?|protein|genomic\w*|cell|immun\w*|pathology|"
+    r"toxicology|formulation|analytical|bioanalytical|physics|environmental|agricultur\w*|food)\b"
+)
+ML_STRONG_RE = re.compile(
+    r"\b(?:machine learning|ml|ai|artificial intelligence|deep learning|computational|nlp|"
+    r"computer vision)\b"
 )
 TECHNICAL_STAFF_RE = re.compile(r"\b(?:member of (?:the )?)?technical staff\b")
 NEW_GRAD_TITLE_RE = re.compile(
@@ -159,7 +188,7 @@ DEFAULT_EXCLUDED_COMPANIES = (
     "Voyagertechnologiesinc", "Epirus", "Castelion", "Hadrian", "Skydio", "Hermeus",
     "Joby Aviation", "Archer Aviation", "Boom Supersonic", "Varda Space", "K2 Space",
     "Apex Space", "Vast", "Shield", "f7d8749a-72d6-407c-bf98-292ea630c73a",
-    "Fantom Corporation", "Graham Capital Management", "Grahamcapitalmanagement",
+    "Fantom Corporation", "Graham Capital Management", "Grahamcapitalmanagement", "Amentum",
 )
 EXCLUDED_COMPANIES_PATH = STATE_DIR / "excluded_companies.json"
 US_STATE_CODES = (
@@ -200,7 +229,18 @@ NON_US_LOCATION_RE = re.compile(
     r"indonesia|malaysia|thailand|pakistan|nigeria|kenya|egypt|south africa|uae|"
     r"dubai|saudi|qatar|turkey|istanbul|romania|bucharest|ukraine|czech|prague|"
     r"hungary|budapest|greece|italy|milan|rome|belgium|brussels|austria|vienna|"
-    r"estonia|serbia|belgrade|costa rica|peru)\b",
+    r"estonia|serbia|belgrade|costa rica|peru|"
+    r"noida|gurgaon|gurugram|kolkata|ahmedabad|kochi|cochin|coimbatore|trivandrum|"
+    r"thiruvananthapuram|mysore|mysuru|indore|jaipur|chandigarh|vadodara|nagpur|"
+    r"visakhapatnam|bhubaneswar|karnataka|maharashtra|telangana|tamil nadu|uttar pradesh|"
+    r"haryana|kerala|gujarat|west bengal|andhra pradesh|bangladesh|dhaka|sri lanka|colombo|"
+    r"nepal|kathmandu|karachi|lahore|islamabad|manila|cebu|lagos|nairobi|cairo|krakow|"
+    r"wroclaw|cluj|sofia|bulgaria|lithuania|vilnius|latvia|riga|croatia|zagreb|slovakia|"
+    r"bratislava|slovenia|guadalajara|monterrey|bogota|medellin|buenos aires|santiago|"
+    r"montevideo|uruguay|kuala lumpur|jakarta|ho chi minh|hanoi|bangkok|"
+    r"ind|gbr|deu|fra|esp|pol|mex|bra|chn|jpn|kor|sgp|aus|irl|nld|isr|phl|vnm|rou|hun|"
+    r"cze|che|swe|nor|dnk|fin|bel|aut|ita|prt|tur|egy|zaf|nga|ken|pak|bgd|lka|mys|tha|"
+    r"idn|arg|chl|cri)\b",
     re.I,
 )
 GENERIC_LOCATION_RE = re.compile(
@@ -232,11 +272,11 @@ CITIZENSHIP_REQUIREMENT_RE = re.compile(
     re.I,
 )
 WORD_NUMBERS = {
-    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
 }
 YEARS_RE = re.compile(
-    r"\b(?P<low>\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\s*"
+    r"\b(?P<low>\d{1,2}|zero|one|two|three|four|five|six|seven|eight|nine|ten)\s*"
     r"(?:\+|plus)?\s*(?:(?:-|–|to)\s*(?P<high>\d{1,2})\s*\+?\s*)?(?:years?|yrs?)\b",
     re.I,
 )
@@ -245,8 +285,27 @@ REQUIREMENT_CUE_RE = re.compile(
     re.I,
 )
 COMPANY_HISTORY_RE = re.compile(
-    r"(?:over|more than|nearly|almost|for (?:the )?(?:past|last))\s*$", re.I
+    r"(?:over|more than|nearly|almost|for (?:the )?(?:past|last)|around for|in business for|"
+    r"founded|since|history of)\s*$", re.I
 )
+_N = r"(\d{1,2}|zero|one|two|three|four|five|six|seven|eight|nine|ten)"
+# Tiered requirements ("BS + 6 years OR MS + 5 years OR PhD"): the Master's path applies.
+MASTERS_YEARS_RE = re.compile(
+    rf"\b(?:master'?s|ms|m\.s\.|msc)\b[^.;]{{0,60}}?\b{_N}\s*\+?\s*(?:years?|yrs)\b"
+    rf"|\b{_N}\s*\+?\s*(?:years?|yrs)\b[^.;]{{0,40}}?\b(?:with|and|plus)\s+(?:an?\s+)?"
+    rf"(?:master'?s|ms|m\.s\.)\b",
+    re.I,
+)
+DEGREE_OR_YEARS_RE = re.compile(rf"\bdegree\b[^.;]{{0,80}}?\bor\s+{_N}\s*\+?\s*(?:years?|yrs)", re.I)
+MASTERS_ALTERNATIVE_RE = re.compile(
+    r"\b(?:or|with)\s+(?:an?\s+|the\s+)?(?:master'?s|ms|m\.s\.|mba|ph\.?d\.?|doctorate|"
+    r"graduate degree|advanced degree)\b",
+    re.I,
+)
+NEW_GRAD_CREDIT_RE = re.compile(
+    r"\binternships?\b|\bco-?ops?\b|\bacademic\b|\bcoursework\b|\bresearch experience\b", re.I
+)
+SEPARATE_TRACK_RE = re.compile(r"\bexperienced hires?\b|\bfor senior\b", re.I)
 PREFERRED_CUE_RE = re.compile(
     r"\b(?:preferred|nice[- ]to[- ]have|bonus|(?:is|are|a|big) plus|ideally|desired|"
     r"desirable|preferably)\b",
@@ -264,9 +323,31 @@ NEW_GRAD_SUBSTITUTE_RE = re.compile(
 )
 SENIOR_PHRASE_RE = re.compile(
     r"\bsenior[- ]level experience\b|\bseasoned (?:software )?engineer\b|"
+    r"\bmid[- ]?(?:senior[- ])?level\b|\bmid[- ]senior\b|\b(?:several|many|multiple) years\b|"
+    r"\bproven track record\b|"
+    r"\b(?:deep|extensive|significant|substantial) (?:professional |industry |hands-on )?"
+    r"(?:expertise|experience) (?:in|with|building|designing|developing|leading|shipping|"
+    r"working|writing|running|operating|delivering)\b|"
     r"\b(?:an?|seeking|looking for)\s+(?:highly\s+)?experienced\s+"
     r"(?:software\s+|backend\s+|full[- ]stack\s+)?engineer\b(?!s)",
     re.I,
+)
+OPTIONAL_HEADER_RE = re.compile(
+    r"\b(?:(?:preferred|desired|bonus|additional|nice[- ]to[- ]have)\s+(?:qualifications|skills|"
+    r"requirements|experience|points)|nice[- ]to[- ]haves?|bonus points|considerations for top "
+    r"candidates|it(?:'s| is| would be) a plus if|pluses)\b\s*:?",
+    re.I,
+)
+REQUIRED_HEADER_RE = re.compile(
+    r"\b(?:(?:basic|minimum|required|must[- ]have)\s+(?:qualifications|skills|requirements|"
+    r"experience)|qualifications|requirements|what you(?:'ll| will) need(?: to succeed)?|"
+    r"what we(?:'re| are) looking for|who you are|about you)\b\s*:?",
+    re.I,
+)
+# One pass, optional headers first, so "Preferred Qualifications" is never read as
+# a bare "Qualifications" header.
+SECTION_HEADER_RE = re.compile(
+    f"(?P<optional>{OPTIONAL_HEADER_RE.pattern})|(?P<required>{REQUIRED_HEADER_RE.pattern})", re.I
 )
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+|\n+|\s+[•·▪]\s*|\s+-\s+(?=[A-Z])")
 
@@ -309,12 +390,21 @@ def in_role_family(title: object) -> bool:
         return False
     if ROLE_NOUN_RE.search(text):
         return bool(SELF_SUFFICIENT_ROLE_RE.search(text) or DOMAIN_RE.search(text))
-    noun = WEAK_ROLE_NOUN_RE.search(text)
-    if not noun:
+    nouns = {match.group(0).rstrip("s") for match in WEAK_ROLE_NOUN_RE.finditer(text)}
+    if not nouns:
         return False
-    if noun.group(0).startswith(("scientist", "researcher")) and re.search(r"\bresearch\b", text):
+    if "analyst" in nouns:
+        # "Data Analyst", "Analytics Analyst", "Analyst, Data Systems" -- not
+        # "Facility Analyst" or "Business Analyst, Finance AI".
+        trailing = ANALYST_TRAILING_RE.search(text)
+        if ANALYST_DIRECT_RE.search(text) or (trailing and not BUSINESS_RE.search(text)):
+            return True
+    if "associate" in nouns and ASSOCIATE_DIRECT_RE.search(text):
         return True
-    return bool(WEAK_ROLE_DOMAIN_RE.search(text))
+    if nouns & {"scientist", "researcher"} and SCIENCE_DOMAIN_RE.search(text):
+        # Lab, pharma and humanities scientists need an ML or computational angle.
+        return not (NON_TECH_SCIENCE_RE.search(text) and not ML_STRONG_RE.search(text))
+    return False
 
 
 def has_excluded_title(title: object) -> bool:
@@ -330,18 +420,37 @@ def title_rejection(title: object) -> str | None:
     return None
 
 
-def is_us_location(locations: list[str]) -> bool:
-    values = [re.sub(r"\s+", " ", str(value)).strip() for value in locations or []]
-    if any(
-        US_STATE_CODE_RE.search(value) or US_LOCATION_RE.search(value)
-        or value.strip(" .") in US_STATE_CODE_SET
-        for value in values
-    ):
+# A "Remote" or blank location counts only if the posting itself says US.
+US_REMOTE_EVIDENCE_RE = re.compile(
+    r"\b(?:united states|u\.s\.|usa|us[- ]based|based in the us|(?:anywhere|located|reside|"
+    r"residing) (?:in|within) the (?:us|u\.s\.|united states)|within the (?:us|u\.s\.)|"
+    r"us time ?zones?|(?:eastern|pacific|central|mountain) time|est|pst|cst)\b",
+    re.I,
+)
+EXPLICIT_US_RE = re.compile(r"\b(?:united states|usa|u\.s\.a?\.?)\b", re.I)
+
+
+def location_is_us(value: str, allow_bare_code: bool = True) -> bool:
+    if EXPLICIT_US_RE.search(value):
         return True
-    if any(NON_US_LOCATION_RE.search(value) for value in values):
+    if NON_US_LOCATION_RE.search(value):
+        return False  # "Noida, Uttar Pradesh, India" is not Indiana
+    if allow_bare_code and value.strip(" .") in US_STATE_CODE_SET:
+        return True
+    return bool(US_STATE_CODE_RE.search(value) or US_LOCATION_RE.search(value))
+
+
+def is_us_location(locations: list[str], description: str | None = None) -> bool:
+    values = [re.sub(r"\s+", " ", str(value)).strip() for value in locations or []]
+    foreign = any(NON_US_LOCATION_RE.search(value) for value in values)
+    if any(location_is_us(value, allow_bare_code=not foreign) for value in values):
+        return True
+    if foreign:
         return False
-    # "Remote", "Hybrid" or nothing at all: the registry is US-heavy, so keep it.
-    return all(GENERIC_LOCATION_RE.match(value.strip(" ,;()-")) for value in values)
+    # Only "Remote", "Hybrid" or nothing at all: keep it only if the posting says US.
+    if not all(GENERIC_LOCATION_RE.match(value.strip(" ,;()-")) for value in values):
+        return False
+    return bool(description and US_REMOTE_EVIDENCE_RE.search(description))
 
 
 def description_mentions_citizenship_requirement(description: str) -> bool:
@@ -356,34 +465,84 @@ def potential_match(job: dict) -> bool:
     }
 
 
-def required_years(text: str) -> int | None:
-    """Smallest years-of-experience figure stated as a hard requirement."""
-    found = []
-    for sentence in SENTENCE_SPLIT_RE.split(text or ""):
-        if PREFERRED_CUE_RE.search(sentence) or NEW_GRAD_SUBSTITUTE_RE.search(sentence):
+def _number(raw: str) -> int:
+    raw = raw.lower()
+    return WORD_NUMBERS[raw] if raw in WORD_NUMBERS else int(raw)
+
+
+def requirement_sentences(text: str):
+    """Yield (sentence, optional) pairs. Text under a "Preferred qualifications",
+    "Nice to have" or similar header is optional until the next required header,
+    even when the posting runs its sections together without periods."""
+    marked = SECTION_HEADER_RE.sub(
+        lambda m: ("\n\u0001" if m.group("optional") else "\n\u0002") + m.group(0), text or ""
+    )
+    optional = False
+    for sentence in SENTENCE_SPLIT_RE.split(marked):
+        if sentence.startswith("\u0001"):
+            optional = True
+        elif sentence.startswith("\u0002"):
+            optional = False
+        sentence = sentence.lstrip("\u0001\u0002").strip()
+        if sentence:
+            yield sentence, optional
+
+
+def sentence_required_years(sentence: str, strict_cues: bool = False) -> int | None:
+    """Years a sentence demands of a Master's new grad, or None if it demands none."""
+    if PREFERRED_CUE_RE.search(sentence) or SEPARATE_TRACK_RE.search(sentence):
+        return None
+    masters = MASTERS_YEARS_RE.search(sentence)
+    if masters:
+        return _number(next(group for group in masters.groups() if group))
+    if DEGREE_OR_YEARS_RE.search(sentence) or MASTERS_ALTERNATIVE_RE.search(sentence):
+        return None  # the degree on its own qualifies
+    years, cued = [], []
+    for match in YEARS_RE.finditer(sentence):
+        low = _number(match.group("low"))
+        high = match.group("high")
+        if low > 15 or COMPANY_HISTORY_RE.search(sentence[max(0, match.start() - 30): match.start()]):
             continue
-        for match in YEARS_RE.finditer(sentence):
-            raw = match.group("low").lower()
-            low = WORD_NUMBERS.get(raw) or int(raw)
-            if low > 15 or COMPANY_HISTORY_RE.search(sentence[max(0, match.start() - 25): match.start()]):
-                continue
-            window = sentence[max(0, match.start() - 50): match.end() + 80]
-            if REQUIREMENT_CUE_RE.search(window):
-                found.append(low)
-    return min(found) if found else None
+        if high and low == 2 and int(high) <= 3:
+            low = 1  # "2-3 years" is a junior band
+        phrase = match.group(0)
+        window = sentence[max(0, match.start() - 50): match.end() + 80]
+        if REQUIREMENT_CUE_RE.search(window):
+            cued.append(low)
+            years.append(low)
+        elif re.search(r"\+|plus|[-\u2013]|\bto\b", phrase):
+            years.append(low)  # "3+ years building ..." is a requirement too
+    if not years:
+        return None
+    if NEW_GRAD_CREDIT_RE.search(sentence) and max(years) < 3:
+        return None  # internships and research count
+    if strict_cues:
+        return max(cued) if cued else None
+    return max(years)
+
+
+def required_years(text: str, strict_cues: bool = False) -> int | None:
+    """The strictest years-of-experience requirement in the posting. With
+    strict_cues, only figures tied to "experience", "required", "minimum" count."""
+    found = [
+        years for sentence, optional in requirement_sentences(text)
+        if not optional and (years := sentence_required_years(sentence, strict_cues)) is not None
+    ]
+    return max(found) if found else None
 
 
 def asks_for_too_much_experience(text: str, title: object = "") -> bool:
-    lowered = (text or "").lower()
-    if re.search(r"\b(?:0|1|2)\s*(?:-|–|to)\s*[123]\s*years?\b|\bup\s+to\s+[23]\s+years?\b", lowered):
-        return False
-    years = required_years(text)
+    new_grad_title = bool(NEW_GRAD_TITLE_RE.search(normalize_title(title)))
+    years = required_years(text, strict_cues=new_grad_title)
     if years is not None:
         if years >= 3:
             return True
-        if years == 2 and not NEW_GRAD_TITLE_RE.search(normalize_title(title)):
+        if years == 2 and not new_grad_title:
             return True
-    return bool(SENIOR_PHRASE_RE.search(text or ""))
+    return any(
+        SENIOR_PHRASE_RE.search(sentence) and not optional and not PREFERRED_CUE_RE.search(sentence)
+        for sentence, optional in requirement_sentences(text)
+    )
 
 
 def matches(job: dict) -> bool:
@@ -393,7 +552,7 @@ def matches(job: dict) -> bool:
 def rejection_reason(job: dict, now: int | None = None) -> str:
     if not job.get("active") or not job.get("is_visible", True):
         return "inactive"
-    posted_at = job_posted_timestamp(job)
+    posted_at = freshness_timestamp(job)
     if posted_at is None:
         return "missing_posted_time"
     current_time = int(time.time()) if now is None else now
@@ -409,7 +568,7 @@ def rejection_reason(job: dict, now: int | None = None) -> str:
     description = str(job.get("description", ""))
     if asks_for_too_much_experience(f"{title}. {description}", title):
         return "too_much_experience"
-    if not is_us_location(job.get("locations") or []):
+    if not is_us_location(job.get("locations") or [], description):
         return "outside_us"
     if not description_mentions_citizenship_requirement(description):
         return "citizenship_requirement"
@@ -763,6 +922,44 @@ def experience_summary(job: dict) -> str:
     return "Entry level"
 
 
+try:
+    from zoneinfo import ZoneInfo
+    DISPLAY_TZ = ZoneInfo("America/New_York")
+except Exception:  # no tz database: fall back to UTC
+    DISPLAY_TZ = timezone.utc
+
+
+def posted_label(job: dict, now: int | None = None) -> str:
+    """When the company posted the job (not when the watcher found it)."""
+    current_time = int(time.time()) if now is None else now
+    precision = job.get("posted_precision", "time")
+    timestamp = job_posted_timestamp(job)
+    if timestamp is None:
+        detected = parse_job_datetime(job.get("detected_at"))
+        seen = f" (seen {_ago(current_time - detected)})" if detected else ""
+        return f"Not published{seen}"
+    if precision == "date":
+        day = datetime.fromtimestamp(timestamp, timezone.utc)
+        return f"{day:%b} {day.day}"
+    local = datetime.fromtimestamp(timestamp, DISPLAY_TZ)
+    zone = "ET" if DISPLAY_TZ is not timezone.utc else "UTC"
+    stamp = f"{local:%b} {local.day}, {local.hour % 12 or 12}:{local:%M} {local:%p} {zone}"
+    if precision == "listed":
+        return f"Listed {_ago(current_time - timestamp)} on Simplify ({stamp})"
+    return f"{_ago(current_time - timestamp)} · {stamp}"
+
+
+def _ago(seconds: int) -> str:
+    seconds = max(int(seconds), 0)
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 172800:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
 def relative_posted_time(job: dict, now: int | None = None) -> str:
     if job.get("posted_display"):
         return str(job["posted_display"])
@@ -843,9 +1040,15 @@ def job_posted_timestamp(job: dict) -> int | None:
     return None
 
 
+def freshness_timestamp(job: dict) -> int | None:
+    """When the job became visible: first-seen time for date-only or undated
+    postings, otherwise the posting time."""
+    return parse_job_datetime(job.get("detected_at")) or job_posted_timestamp(job)
+
+
 def job_is_recent(job: dict, now: int | None = None) -> bool:
     current_time = int(time.time()) if now is None else now
-    posted_at = job_posted_timestamp(job)
+    posted_at = freshness_timestamp(job)
     if posted_at is None:
         return False
     age = current_time - posted_at
@@ -1087,12 +1290,25 @@ def board_company(board: dict) -> str:
     return company_from_slug(slug)
 
 
-def detected_posted_at(value: object, now: int) -> int:
-    """A job first seen within two days of a date-only posting date was just posted."""
+DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def with_posting(job: dict, value: object, now: int) -> dict:
+    """Keep the source's real posting time for display. When the source gives only a
+    date (or nothing), freshness comes from when we first saw the job: a job first
+    seen within two days of its posting date was just posted."""
     timestamp = parse_job_datetime(value)
-    if timestamp is None or now - timestamp <= FRESH_DATE_SECONDS:
-        return now
-    return timestamp
+    job["posted_at"] = value if timestamp is not None else None
+    if timestamp is None:
+        job["posted_precision"] = "unknown"
+        job["detected_at"] = now
+    elif DATE_ONLY_RE.match(str(value).strip()):
+        job["posted_precision"] = "date"
+        if now - timestamp <= FRESH_DATE_SECONDS:
+            job["detected_at"] = now
+    else:
+        job["posted_precision"] = "time"
+    return job
 
 
 def workday_posted_days(text: object) -> int:
@@ -1205,13 +1421,13 @@ def fetch_workday_board(board: dict, now: int) -> list[dict]:
         locations = [info.get("location") or posting.get("locationsText")]
         locations += [str(value) for value in info.get("additionalLocations") or []]
         locations.append((info.get("country") or {}).get("descriptor"))
-        return direct_job(
+        return with_posting(direct_job(
             board, job_id, str(info.get("title") or posting.get("title") or ""),
             [str(value) for value in locations if value],
             str(info.get("externalUrl") or f"https://{host}/{site}{path}"),
             plain_text(str(info.get("jobDescription") or "")),
-            detected_posted_at(info.get("startDate"), now),
-        )
+            None,
+        ), info.get("startDate"), now)
 
     return plan.details(one)
 
@@ -1235,7 +1451,8 @@ def fetch_oracle_board(board: dict, now: int) -> list[dict]:
             f"{api}/recruitingCEJobRequisitionDetails?expand=all&onlyData=true"
             f"&finder=ById;Id=%22{urllib.parse.quote(job_id)}%22,siteNumber={site}"
         ).get("items") or [{}])[0]
-        locations = [item.get("PrimaryLocation"), item.get("PrimaryLocationCountry")]
+        country = str(item.get("PrimaryLocationCountry") or "").upper()
+        locations = [item.get("PrimaryLocation"), "United States" if country == "US" else ""]
         locations += [
             value.get("Name") or value.get("LocationName") or ""
             for value in item.get("secondaryLocations") or [] if isinstance(value, dict)
@@ -1243,13 +1460,13 @@ def fetch_oracle_board(board: dict, now: int) -> list[dict]:
         description = " ".join(plain_text(str(detail.get(key) or "")) for key in (
             "ExternalDescriptionStr", "ExternalResponsibilitiesStr", "ExternalQualificationsStr",
         ))
-        return direct_job(
+        return with_posting(direct_job(
             board, job_id, str(item.get("Title") or ""),
             [str(value) for value in locations if value],
             f"https://{host}/hcmUI/CandidateExperience/en/sites/{site}/job/{job_id}",
             description or plain_text(str(item.get("ShortDescriptionStr") or "")),
-            detected_posted_at(item.get("PostedDate"), now),
-        )
+            None,
+        ), item.get("PostedDate"), now)
 
     return plan.details(one)
 
@@ -1270,7 +1487,7 @@ def fetch_bamboohr_board(board: dict, now: int) -> list[dict]:
         ]
         if item.get("isRemote"):
             locations.append("Remote")
-        return direct_job(
+        return with_posting(direct_job(
             board, job_id, str(opening.get("jobOpeningName") or item.get("jobOpeningName") or ""),
             [value for value in locations if value],
             str(opening.get("jobOpeningShareUrl") or f"{base}/{job_id}"),
@@ -1278,8 +1495,8 @@ def fetch_bamboohr_board(board: dict, now: int) -> list[dict]:
                 str(opening.get("minimumExperience") or ""),
                 plain_text(str(opening.get("description") or "")),
             ])),
-            detected_posted_at(opening.get("datePosted"), now),
-        )
+            None,
+        ), opening.get("datePosted"), now)
 
     return plan.details(one)
 
@@ -1297,13 +1514,13 @@ def fetch_rippling_board(board: dict, now: int) -> list[dict]:
             description = " ".join(str(value or "") for value in description.values())
         locations = [str(value) for value in detail.get("workLocations") or []]
         locations.append(str((item.get("workLocation") or {}).get("label") or ""))
-        job = direct_job(
+        job = with_posting(direct_job(
             board, job_id, str(detail.get("name") or item.get("name") or ""),
             [value for value in locations if value],
             str(detail.get("url") or item.get("url") or ""),
             plain_text(str(description)),
-            detected_posted_at(detail.get("createdOn"), now),
-        )
+            None,
+        ), detail.get("createdOn"), now)
         if detail.get("companyName") and not board.get("company"):
             job["company_name"] = str(detail["companyName"])
         return job
@@ -1329,12 +1546,12 @@ def fetch_jobvite_board(board: dict, now: int) -> list[dict]:
         path, title, location = payload
         detail = fetch_text(f"https://jobs.jobvite.com{path}")
         match = re.search(r'<div class="jv-job-detail-description"[^>]*>(.*?)<div class="jv-job-detail-bottom', detail, re.S)
-        return direct_job(
+        return with_posting(direct_job(
             board, job_id, title, [location],
             f"https://jobs.jobvite.com{path}",
             plain_text(match.group(1) if match else detail),
-            now,  # Jobvite publishes no date; first seen is the best signal
-        )
+            None,
+        ), None, now)  # Jobvite publishes no date; first seen is the best signal
 
     return plan.details(one)
 
@@ -1625,6 +1842,7 @@ def simplify_jobs(listings: list[dict], now: int) -> list[dict]:
                 "U.S. citizenship is required." if listing.get("sponsorship") == SIMPLIFY_CITIZENSHIP else ""
             ),
             "posted_at": posted,
+            "posted_precision": "listed",
             "active": bool(listing.get("active", True)),
             "is_visible": bool(listing.get("is_visible", True)),
         })
@@ -2107,7 +2325,7 @@ def send_push(jobs: list[dict]) -> None:
         "title": f'{display_company_name(job.get("company_name"))}: {job.get("title", "")}'[:250],
         "message": " · ".join(filter(None, [
             ", ".join(str(value) for value in (job.get("locations") or [])[:2]),
-            relative_posted_time(job),
+            f"Posted {posted_label(job)}",
             experience_summary(job),
         ])),
         "click": str(job.get("url") or ""),
@@ -2157,7 +2375,7 @@ def send_email(jobs: list[dict], subject_prefix: str = "") -> None:
     subject = f"{subject_prefix}{len(jobs)} new US tech job{'s' if len(jobs) != 1 else ''}"
     rows = []
     text_rows = [
-        f"{'Cat':<8} {'Role':<42} {'Company':<38} {'Experience':<14} {'Posted':<10}",
+        f"{'Cat':<8} {'Role':<42} {'Company':<38} {'Experience':<14} Posted",
         f"{'-' * 8} {'-' * 42} {'-' * 38} {'-' * 14} {'-' * 10}",
     ]
     category_order = {name: index for index, name in enumerate(
@@ -2177,15 +2395,15 @@ def send_email(jobs: list[dict], subject_prefix: str = "") -> None:
         role = html.escape(str(job.get("title", "Untitled role")))
         company = html.escape(display_company_name(job.get("company_name", "Unknown company")))
         experience = html.escape(experience_summary(job))
-        posted = html.escape(relative_posted_time(job))
+        posted = html.escape(posted_label(job))
         url = html.escape(str(job.get("url", "")), quote=True)
         text_category = plain_text(role_category(job))[:8]
         text_role = plain_text(str(job.get("title", "Untitled role")))[:42]
         text_company = display_company_name(job.get("company_name", "Unknown company"))[:38]
         text_experience = plain_text(experience_summary(job))[:14]
-        text_posted = plain_text(relative_posted_time(job))[:10]
+        text_posted = plain_text(posted_label(job))
         text_rows.append(
-            f"{text_category:<8} {text_role:<42} {text_company:<38} {text_experience:<14} {text_posted:<10}"
+            f"{text_category:<8} {text_role:<42} {text_company:<38} {text_experience:<14} {text_posted}"
         )
         previous_category = category
         rows.append(
@@ -2341,8 +2559,9 @@ def source_candidates(
         detected_at = int(time.time())
         for job in jobs:
             if stable_id(job) not in observed:
-                job["posted_at"] = detected_at
-                job["posted_display"] = "Newly detected"
+                job["detected_at"] = detected_at
+                if job.get("posted_at") and DATE_ONLY_RE.match(str(job["posted_at"]).strip()):
+                    job["posted_precision"] = "date"
         connection.executemany(
             "INSERT OR IGNORE INTO observed_source_jobs(source, job_id) VALUES (?, ?)",
             [(source_key, job_id) for job_id in job_ids],
