@@ -568,6 +568,13 @@ def board_interval_seconds(relevant_count: int, match_count: int) -> int:
     return BASE_POLL_SECONDS
 
 
+def jittered(seconds: int, board_key: str) -> int:
+    """Spread boards over +-25% of their interval (stable per board) so they don't
+    all come due on the same run."""
+    fraction = int(hashlib.sha256(board_key.encode()).hexdigest()[:4], 16) / 0xFFFF
+    return int(seconds * (0.75 + 0.5 * fraction))
+
+
 def failure_retry_seconds(failure_count: int) -> int:
     if failure_count >= 3:
         return 7 * 24 * 60 * 60
@@ -602,9 +609,9 @@ def select_due_boards(
                 board_stats["failure_count"]
             )
         else:
-            next_check = board_stats["last_checked"] + board_interval_seconds(
+            next_check = board_stats["last_checked"] + jittered(board_interval_seconds(
                 board_stats["relevant_count"], board_stats["match_count"]
-            )
+            ), board_key)
         if next_check <= current_time:
             due.append((next_check, board_key, board))
     due.sort(key=lambda item: (item[0], item[1]))
@@ -1137,8 +1144,9 @@ class DetailPlan:
 
 
 WORKDAY_SLOTS = threading.BoundedSemaphore(3)
-WORKDAY_HOST_SPACING_SECONDS = 0.25
-WORKDAY_THROTTLED_SPACING_SECONDS = 1.5
+WORKDAY_HOST_SPACING_SECONDS = 0.1
+WORKDAY_THROTTLED_SPACING_SECONDS = 1.0
+WORKDAY_MAX_WAIT_SECONDS = 45
 _workday_lock = threading.Lock()
 _workday_next_slot: dict[str, float] = {}
 _workday_throttled: set[str] = set()
@@ -1154,6 +1162,9 @@ def workday_fetch(url: str, data: bytes | None = None) -> object:
                    else WORKDAY_HOST_SPACING_SECONDS)
         now = time.monotonic()
         start = max(now, _workday_next_slot.get(host, 0.0))
+        if start - now > WORKDAY_MAX_WAIT_SECONDS:
+            # This host is backed up for this run; try the board again on a later run.
+            raise urllib.error.HTTPError(url, 429, "Workday host busy this run", None, None)
         _workday_next_slot[host] = start + spacing
     if start > now:
         time.sleep(start - now)
