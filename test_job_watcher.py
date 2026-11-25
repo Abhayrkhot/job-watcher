@@ -878,6 +878,116 @@ class AlertAuditTests(unittest.TestCase):
         kept = job_watcher.without_direct_duplicates(connection, jobs)
         self.assertEqual([job["url"] for job in kept], [job["url"] for job in jobs[1:]])
 
+    def test_higher_levels_of_a_leveled_posting_do_not_count(self):
+        description = (
+            "Level 1 - No experience required beyond the minimum education requirement.\n"
+            "Level 2 - Two years of directly related experience is required.\n"
+            "Level 3 - Four years of directly related experience is required."
+        )
+        self.assertEqual(self.reason(description, "Developer - Analytics Engineer"), "matched")
+
+
+class PostingPageTests(unittest.TestCase):
+    """Simplify backstop jobs have their posting page read (owner's decision 2026-11-25)."""
+
+    LD_PAGE = """<html><head><script type="application/ld+json">
+    {"@context": "https://schema.org", "@graph": [{"@type": "Organization", "name": "Acme"},
+     {"@type": "JobPosting", "title": "Software Engineer",
+      "description": "&lt;p&gt;Build things.&lt;/p&gt;&lt;ul&gt;&lt;li&gt;Python&lt;/li&gt;&lt;/ul&gt;",
+      "qualifications": "Must be legally authorized to work in the United States without the need for employer sponsorship.",
+      "experienceRequirements": {"@type": "OccupationalExperienceRequirements", "monthsOfExperience": 60}}]}
+    </script></head><body><nav>Careers home</nav></body></html>"""
+
+    def test_reads_the_job_posting_json_ld(self):
+        text = job_watcher.posting_page_text(self.LD_PAGE)
+        self.assertIn("Build things.\nPython", text)
+        self.assertIn("without the need for employer sponsorship", text)
+        self.assertIn("Minimum of 5 years of experience required.", text)
+        self.assertNotIn("Careers home", text)
+
+    def test_falls_back_to_visible_text_before_the_application_form(self):
+        page = ("<html><head><style>p{}</style></head><body><script>var x = '10+ years';</script>"
+                f"<h1>Software Engineer</h1><p>{'About the role. ' * 40}</p>"
+                "<p>Visa sponsorship is not available.</p><h2>Apply for this job</h2>"
+                "<label>How many years of experience do you have?</label><p>7 - 15 Years</p></body></html>")
+        text = job_watcher.posting_page_text(page)
+        self.assertIn("Visa sponsorship is not available.", text)
+        self.assertNotIn("10+ years", text)
+        self.assertNotIn("7 - 15 Years", text)
+
+    def connection(self):
+        directory = Path(tempfile.mkdtemp())
+        with patch("job_watcher.DB_PATH", directory / "jobs.sqlite3"), \
+                patch("job_watcher.STATE_DIR", directory):
+            connection = job_watcher.connect_db()
+        self.addCleanup(connection.close)
+        return connection
+
+    def backstop_job(self, url, title="Software Engineer, New Grad", description=""):
+        return {"source": "simplify", "id": f"simplify:{url}", "title": title, "company_name": "Acme",
+                "locations": ["Austin, TX"], "url": url, "description": description,
+                "posted_at": int(time.time()) - 600, "posted_precision": "listed",
+                "active": True, "is_visible": True}
+
+    def test_only_new_matching_jobs_without_a_description_are_read(self):
+        connection = self.connection()
+        jobs = [
+            self.backstop_job("https://careers.acme.com/1"),  # read: no sponsorship
+            self.backstop_job("https://careers.acme.com/2"),  # read: clean, still mailed
+            self.backstop_job("https://careers.acme.com/3"),  # page fails: left as it was
+            self.backstop_job("https://careers.acme.com/4", title="Senior Software Engineer"),
+            self.backstop_job("https://careers.acme.com/5", description="U.S. citizenship is required."),
+            self.backstop_job("https://careers.acme.com/6", title="Data Engineer, New Grad"),  # mailed
+        ]
+        job_watcher.record_jobs(connection, [jobs[5]])
+        pages = {
+            "https://careers.acme.com/1": "Visa sponsorship is not available for this position.",
+            "https://careers.acme.com/2": "Entry level. 0-2 years of experience.",
+        }
+        read = []
+
+        def fetch(url):
+            read.append(url)
+            if url not in pages:
+                raise http_error(403)
+            return pages[url]
+
+        with patch("job_watcher.fetch_posting_page", side_effect=fetch):
+            job_watcher.with_page_descriptions(connection, jobs)
+        self.assertEqual(sorted(read), [f"https://careers.acme.com/{n}" for n in (1, 2, 3)])
+        self.assertEqual([rejection_reason(job) for job in jobs[:3]], ["no_sponsorship", "matched", "matched"])
+
+    def test_javascript_only_pages_use_the_readers_detail_endpoints(self):
+        calls = []
+
+        def fetch(url, data=None, board=None):
+            calls.append(url)
+            if "bamboohr" in url:
+                return {"result": {"jobOpening": {"minimumExperience": "Mid-level", "description": "<p>Build</p>"}}}
+            return {"items": [{"ExternalQualificationsStr": "<li>We are unable to sponsor visas.</li>"}]}
+
+        with patch("job_watcher.fetch_json", side_effect=fetch), \
+                patch("job_watcher.workday_fetch", return_value={"jobPostingInfo": {"jobDescription": "<p>Ship</p>"}}) as workday:
+            self.assertEqual(job_watcher.fetch_posting_page("https://acme.bamboohr.com/careers/215"), "Mid-level\nBuild")
+            self.assertIn("unable to sponsor", job_watcher.fetch_posting_page(
+                "https://efds.fa.em5.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/74499"))
+            self.assertEqual(job_watcher.fetch_posting_page(
+                "https://acme.wd1.myworkdayjobs.com/en-US/Careers/job/Austin-TX/Engineer_R1"), "Ship")
+        self.assertEqual(calls, [
+            "https://acme.bamboohr.com/careers/215/detail",
+            "https://efds.fa.em5.oraclecloud.com/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails"
+            "?expand=all&onlyData=true&finder=ById;Id=%2274499%22,siteNumber=CX_1",
+        ])
+        workday.assert_called_once_with(
+            "https://acme.wd1.myworkdayjobs.com/wday/cxs/acme/Careers/job/Austin-TX/Engineer_R1")
+
+    def test_page_reads_are_capped_per_run(self):
+        connection = self.connection()
+        jobs = [self.backstop_job(f"https://careers.acme.com/{n}") for n in range(20)]
+        with patch("job_watcher.fetch_posting_page", return_value="0-2 years of experience.") as fetch:
+            job_watcher.with_page_descriptions(connection, jobs)
+        self.assertEqual(fetch.call_count, job_watcher.SIMPLIFY_PAGE_READS_PER_RUN)
+
 
 def http_error(code: int) -> urllib.error.HTTPError:
     return urllib.error.HTTPError("https://example.com", code, "error", None, None)

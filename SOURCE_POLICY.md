@@ -40,8 +40,24 @@ read at the cadence of the watcher's normal polling.
 
 All readers share the global limits: 8 concurrent requests, at most 25 detail
 fetches per board per poll, and the first poll of a board records existing IDs
-without fetching any details. iCIMS, Taleo, Eightfold, and SuccessFactors are not
-read.
+without fetching any details. iCIMS, Taleo, Eightfold, and SuccessFactors boards are
+not polled.
+
+## Posting pages for Simplify backstop jobs
+
+Enabled on 2026-11-25 by the owner's decision. A SimplifyJobs listing has no job
+description, so postings on systems the watcher does not poll (iCIMS, SuccessFactors,
+custom career sites) were mailed without the experience, clearance, or sponsorship
+checks. For those jobs the watcher now reads the posting page itself.
+
+| Source | Endpoint | Constraints |
+| --- | --- | --- |
+| Posting page | `GET` of the apply URL that the Simplify listing links to | Only new jobs that already pass every other filter; one GET per job, never repeated once mailed; at most 12 pages per run and 4 at a time; 10 s timeout and 3 MB cap; no login, cookies, or JavaScript; honest User-Agent; a page that cannot be read leaves the job as it was |
+| Detail endpoint instead of the page | For Workday, Oracle Recruiting, BambooHR, and Workable apply URLs, whose pages render only with JavaScript: the same public job-detail endpoint listed above (Workable: `GET https://apply.workable.com/api/v2/accounts/<account>/jobs/<code>`, which its careers page calls) | Same limits as the page read; Workday requests go through the shared per-host pacing |
+
+The schema.org `JobPosting` JSON-LD that most career pages embed for search engines is
+read first; otherwise the page's visible text, cut off where the application form
+starts. Pages are never crawled for other jobs, and their text is not stored.
 
 ## Optional Approved Sources
 

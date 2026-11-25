@@ -195,6 +195,7 @@ DEFAULT_EXCLUDED_COMPANIES = (
     # intelligence and defense contractors whose roles need a clearance
     "Wyetech", "Agile Defense", "Agiledefense", "BTI360", "Bti36021", "GRVTY",
     "Freedom Consulting Group", "Freedomconsulting", "Anavation", "Anavationllc",
+    "Honeywell Aerospace",
 )
 EXCLUDED_COMPANIES_PATH = STATE_DIR / "excluded_companies.json"
 US_STATE_CODES = (
@@ -408,6 +409,11 @@ NEW_GRAD_CREDIT_RE = re.compile(
     r"\binternships?\b|\bco-?ops?\b|\bacademic\b|\bcoursework\b|\bresearch experience\b", re.I
 )
 SEPARATE_TRACK_RE = re.compile(r"\bexperienced hires?\b|\bfor senior\b", re.I)
+# Leveled postings ("Level 1 - no experience required. Level 2 - Two years ...
+# Level 3 - Four years ..."): the higher levels are a separate track.
+HIGHER_LEVEL_RE = re.compile(
+    r"^\W*(?:for\s+)?(?:level|tier|grade)\s+(?:[2-9]|ii|iii|iv|v|two|three|four|five)\b", re.I
+)
 PREFERRED_CUE_RE = re.compile(
     r"\b(?:preferred|nice[- ]to[- ]have|bonus|(?:is|are|a|big) plus|ideally|desired|"
     r"desirable|preferably)\b",
@@ -620,7 +626,8 @@ def requirement_sentences(text: str):
 
 def sentence_required_years(sentence: str, strict_cues: bool = False) -> int | None:
     """Years a sentence demands of a Master's new grad, or None if it demands none."""
-    if SEPARATE_TRACK_RE.search(sentence) or sentence.rstrip().endswith("?"):
+    if (SEPARATE_TRACK_RE.search(sentence) or HIGHER_LEVEL_RE.search(sentence)
+            or sentence.rstrip().endswith("?")):
         return None  # another track, or an application question
     masters = MASTERS_YEARS_RE.search(sentence)
     if masters and not PREFERRED_CUE_RE.search(sentence):
@@ -666,10 +673,17 @@ def sentence_required_years(sentence: str, strict_cues: bool = False) -> int | N
 def required_years(text: str, strict_cues: bool = False) -> int | None:
     """The strictest years-of-experience requirement in the posting. With
     strict_cues, only figures tied to "experience", "required", "minimum" count."""
-    found = [
-        years for sentence, optional in requirement_sentences(text)
-        if not optional and (years := sentence_required_years(sentence, strict_cues)) is not None
-    ]
+    found = []
+    under_higher_level = False
+    for sentence, optional in requirement_sentences(text):
+        if under_higher_level:  # the sentence after a bare "Level 3 -" belongs to it
+            under_higher_level = False
+            continue
+        if HIGHER_LEVEL_RE.search(sentence):
+            under_higher_level = len(sentence) < 20
+            continue
+        if not optional and (years := sentence_required_years(sentence, strict_cues)) is not None:
+            found.append(years)
     return max(found) if found else None
 
 
@@ -2052,6 +2066,145 @@ def without_direct_duplicates(connection: sqlite3.Connection, jobs: list[dict]) 
     return kept
 
 
+# --- Posting pages for Simplify backstop jobs --------------------------------------
+# Enabled on 2026-11-25 by the owner's decision (see SOURCE_POLICY.md). A Simplify
+# listing carries no description, so a new backstop job that passes every other
+# filter has its public posting page read once, with no login, cookies or scripts,
+# and the experience, clearance and sponsorship rules run on that text. Most career
+# sites (iCIMS, Workday, Jibe, Lever, Ashby) embed a schema.org JobPosting, which is
+# the clean description; otherwise the page's visible text is used, cut off where
+# the application form starts. A page that cannot be read leaves the job as it was.
+SIMPLIFY_PAGE_READS_PER_RUN = 12
+PAGE_READ_WORKERS = 4
+PAGE_READ_TIMEOUT_SECONDS = 10
+PAGE_READ_MAX_BYTES = 3_000_000
+LD_JSON_RE = re.compile(r"<script[^>]*application/ld\+json[^>]*>(.*?)</script>", re.S | re.I)
+HIDDEN_BLOCK_RE = re.compile(r"<(script|style|noscript|template|svg)\b.*?</\1\s*>", re.S | re.I)
+APPLICATION_FORM_RE = re.compile(
+    r"\b(?:apply for this (?:job|position|role)|submit (?:your )?application|first name\s*\*|"
+    r"resume/cv|attach resume|upload (?:your )?resume|paste your resume|"
+    r"voluntary self-identification)\b",
+    re.I,
+)
+
+
+def job_postings(data: object):
+    """Every schema.org JobPosting in a parsed JSON-LD block."""
+    if isinstance(data, list):
+        for item in data:
+            yield from job_postings(item)
+    elif isinstance(data, dict):
+        kind = data.get("@type")
+        if kind == "JobPosting" or (isinstance(kind, list) and "JobPosting" in kind):
+            yield data
+        for item in data.get("@graph") or []:
+            yield from job_postings(item)
+
+
+def posting_page_text(page: str) -> str:
+    for block in LD_JSON_RE.findall(page):
+        try:
+            data = json.loads(block.strip())
+        except ValueError:
+            continue
+        for posting in job_postings(data):
+            parts = [str(posting.get(key) or "") for key in ("description", "qualifications")]
+            experience = posting.get("experienceRequirements")
+            if isinstance(experience, dict) and experience.get("monthsOfExperience"):
+                months = int(float(experience["monthsOfExperience"]))
+                parts.append(f"Minimum of {months // 12} years of experience required.")
+            elif isinstance(experience, str):
+                parts.append(experience)
+            text = plain_text("\n".join(part for part in parts if part))
+            if text:
+                return text
+    body = re.search(r"<body\b.*", page, re.S | re.I)
+    text = plain_text(HIDDEN_BLOCK_RE.sub(" ", body.group(0) if body else page))
+    form = APPLICATION_FORM_RE.search(text)
+    return text[: form.start()] if form and form.start() > 500 else text
+
+
+def ats_detail_text(url: str) -> str | None:
+    """The description from the public detail endpoint the watcher's own reader uses,
+    for posting pages that render only with JavaScript. None for other systems."""
+    board = board_from_url(url)
+    provider = (board or {}).get("provider")
+    path = [segment for segment in urllib.parse.urlsplit(url).path.split("/") if segment]
+    if provider == "workday" and "job" in path:
+        host, tenant, site = str(board["slug"]).split("/", 2)
+        rest = "/".join(path[path.index("job"):])
+        info = (workday_fetch(f"https://{host}/wday/cxs/{tenant}/{site}/{rest}") or {}).get(
+            "jobPostingInfo") or {}
+        return plain_text(str(info.get("jobDescription") or ""))
+    if provider == "oracle" and "job" in path and len(path) > path.index("job") + 1:
+        host, site = str(board["slug"]).split("/", 1)
+        job_id = urllib.parse.quote(path[path.index("job") + 1])
+        detail = (fetch_json(
+            f"https://{host}/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails"
+            f"?expand=all&onlyData=true&finder=ById;Id=%22{job_id}%22,siteNumber={site}"
+        ).get("items") or [{}])[0]
+        return "\n".join(plain_text(str(detail.get(key) or "")) for key in (
+            "ExternalDescriptionStr", "ExternalResponsibilitiesStr", "ExternalQualificationsStr",
+        )).strip()
+    if provider == "bamboohr" and any(segment.isdigit() for segment in path):
+        job_id = next(segment for segment in path if segment.isdigit())
+        opening = (fetch_json(f'https://{board["slug"]}.bamboohr.com/careers/{job_id}/detail')
+                   .get("result") or {}).get("jobOpening") or {}
+        return "\n".join(filter(None, [
+            str(opening.get("minimumExperience") or ""), plain_text(str(opening.get("description") or "")),
+        ]))
+    if provider == "workable" and "j" in path and len(path) > path.index("j") + 1:
+        code = urllib.parse.quote(path[path.index("j") + 1])
+        detail = fetch_json(f'https://apply.workable.com/api/v2/accounts/{board["slug"]}/jobs/{code}') or {}
+        return "\n".join(plain_text(str(detail.get(key) or "")) for key in ("description", "requirements")).strip()
+    return None
+
+
+def fetch_posting_page(url: str) -> str:
+    detail = ats_detail_text(url)
+    if detail is not None:
+        return detail
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "personal-new-grad-job-watcher/1.0",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Encoding": "gzip",
+    })
+    with urllib.request.urlopen(request, timeout=PAGE_READ_TIMEOUT_SECONDS) as response:
+        body = response.read(PAGE_READ_MAX_BYTES)
+        if response.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        charset = response.headers.get_content_charset() or "utf-8"
+    return posting_page_text(body.decode(charset, "replace"))
+
+
+def with_page_descriptions(connection: sqlite3.Connection, jobs: list[dict]) -> list[dict]:
+    """Fill in the description of new backstop jobs that would otherwise be mailed."""
+    pending = [
+        job for job in jobs
+        if not job.get("description") and job.get("url") and matches(job)
+        and not job_seen(connection, job)
+    ][:SIMPLIFY_PAGE_READS_PER_RUN]
+    failures = []
+
+    def read(job: dict) -> None:
+        try:
+            text = fetch_posting_page(str(job["url"]))
+        except Exception as exc:
+            failures.append(job)
+            print(f"Posting page read failed url={job['url']} error={exc}", file=sys.stderr)
+            return
+        if text:
+            job["description"] = text
+
+    if pending:
+        with ThreadPoolExecutor(PAGE_READ_WORKERS) as executor:
+            list(executor.map(read, pending))
+        rejected = sum(1 for job in pending if not matches(job))
+        print(f"Read {len(pending)} posting pages for Simplify jobs "
+              f"({len(failures)} failed, {rejected} now rejected)")
+    return jobs
+
+
 def fetch_conditional(connection: sqlite3.Connection, url: str) -> bytes | None:
     """GET with If-None-Match and gzip; None when the file has not changed."""
     row = connection.execute("SELECT etag FROM http_cache WHERE url = ?", (url,)).fetchone()
@@ -2093,8 +2246,8 @@ def fetch_simplify(
                 listings = json.loads(body)
                 new_boards += harvest_boards(listings, known, now)
                 if name == "simplify-newgrad":
-                    results.append(("simplify", without_direct_duplicates(
-                        connection, simplify_jobs(listings, now)
+                    results.append(("simplify", with_page_descriptions(
+                        connection, without_direct_duplicates(connection, simplify_jobs(listings, now))
                     )))
         except Exception as exc:
             print(f"Simplify source failed ({name}): {exc}", file=sys.stderr)

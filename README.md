@@ -27,7 +27,8 @@ disqualifiers:
   is a requirement even without the word "experience". A posting is rejected for
   3+ years, or for 2+ years without a new-grad title; "2-3 years" counts as a
   junior band. In tiered wording ("BS + 6 years or MS + 5 years or PhD") the
-  Master's path is the one that counts. "Degree or 4 years", "or a minimum of 5
+  Master's path is the one that counts, and in leveled postings ("Level 1 - none.
+  Level 2 - Two years ...") the higher levels don't count. "Degree or 4 years", "or a minimum of 5
   years" after a degree, "may be substituted for a degree", "including
   internships", and anything under a "Preferred", "Nice to have", or
   "Considerations for top candidates" header don't count. A "preferred", "a plus",
@@ -87,7 +88,11 @@ conditional GET, as a backstop source for roles on systems the watcher can't rea
 mailed once. Simplify listings carry no description, so a Simplify copy of a job on a
 board the watcher already reads in full (baselined more than a day before the
 listing, and reading cleanly) is dropped; otherwise a posting the direct reader
-rejected for experience, sponsorship, or a clearance would be mailed anyway.
+rejected for experience, sponsorship, or a clearance would be mailed anyway. For the
+backstop jobs that remain (iCIMS, SuccessFactors, custom career sites), the watcher
+reads the posting page once before mailing: the schema.org `JobPosting` most career
+pages embed, or else the visible text up to the application form. At most 12 pages
+per run; a page that can't be read leaves the job as it was. See `SOURCE_POLICY.md`.
 
 ## Speed
 
