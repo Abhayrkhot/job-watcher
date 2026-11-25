@@ -1140,10 +1140,17 @@ class BoardHealthTests(unittest.TestCase):
 
 
 class MainRunTests(unittest.TestCase):
-    def run_main(self, boards, fetch_board, fetch_json=None):
+    def run_main(self, boards, fetch_board, fetch_json=None, stats_before=()):
         directory = Path(tempfile.mkdtemp())
         registry = directory / "ats_boards.json"
         registry.write_text(json.dumps(boards))
+        if stats_before:
+            with sqlite3.connect(directory / "jobs.sqlite3") as seed:
+                seed.execute(
+                    "CREATE TABLE board_stats (board_key TEXT PRIMARY KEY, last_checked INTEGER NOT NULL, "
+                    "relevant_count INTEGER NOT NULL DEFAULT 0, match_count INTEGER NOT NULL DEFAULT 0, "
+                    "failure_count INTEGER NOT NULL DEFAULT 0)")
+                seed.executemany("INSERT INTO board_stats VALUES (?, ?, 0, 0, ?)", stats_before)
         patches = [
             patch("job_watcher.STATE_DIR", directory),
             patch("job_watcher.DB_PATH", directory / "jobs.sqlite3"),
@@ -1171,7 +1178,7 @@ class MainRunTests(unittest.TestCase):
         stats = {
             row[0]: row[1:]
             for row in connection.execute(
-                "SELECT board_key, last_checked, failure_count FROM board_stats"
+                "SELECT board_key, last_checked, failure_count, relevant_count FROM board_stats"
             )
         }
         return stats, json.loads(registry.read_text())
@@ -1200,8 +1207,31 @@ class MainRunTests(unittest.TestCase):
         ]
         with patch("job_watcher.time.sleep"):
             stats, _ = self.run_main(boards, read_board, fetch_json)
-        self.assertEqual(stats["workday:redhat.wd5.myworkdayjobs.com/redhat/jobs"][1], 0)
+        self.assertNotIn("workday:redhat.wd5.myworkdayjobs.com/redhat/jobs", stats)  # still due
         self.assertEqual(stats["workday:gone.wd5.myworkdayjobs.com/gone/External"][1], 1)
+
+    def test_deferred_board_is_retried_on_the_next_run(self):
+        # A board released after the outage (failure_count 4) that hits a busy host
+        # keeps its old check time, so it is due again on the next run, not in 40 min.
+        key = "workday:redhat.wd5.myworkdayjobs.com/redhat/jobs"
+
+        def fetch_board(board):
+            raise http_error(429)
+
+        stats, _ = self.run_main(
+            [{"provider": "workday", "slug": key.split(":", 1)[1]}], fetch_board,
+            stats_before=[(key, 1000, 4)],
+        )
+        self.assertEqual(stats[key][:2], (1000, 4))  # untouched, so due on the next run
+
+    def test_deferred_details_make_the_board_hot(self):
+        def fetch_board(board):
+            board["_pending_details"] = 1  # a new posting whose detail fetch got a 429
+            return board, []
+
+        stats, _ = self.run_main([{"provider": "lever", "slug": "acme"}], fetch_board)
+        self.assertEqual(stats["lever:acme"][1:], (0, 1))
+        self.assertEqual(job_watcher.board_interval_seconds(1, 0, "workday"), job_watcher.HOT_POLL_SECONDS)
 
     def test_workday_baseline_then_new_job_is_emailed(self):
         board = {"provider": "workday", "slug": "acme.wd5.myworkdayjobs.com/acme/Careers", "company": "Acme"}
@@ -1284,7 +1314,7 @@ class MainRunTests(unittest.TestCase):
         self.assertEqual(stats["greenhouse:dead"][1], 1)
         self.assertEqual(stats["greenhouse:broken"][1], 1)
         self.assertEqual(stats["greenhouse:slow"][1], 0)
-        self.assertEqual(stats["workday:throttled"][1], 0)  # 429 is not the board's fault
+        self.assertNotIn("workday:throttled", stats)  # 429: not the board's fault, still due
         self.assertNotIn("greenhouse:benchling", stats)
         self.assertIn(
             {"provider": "ashby", "slug": "benchling", "migrated_from": "greenhouse:benchling"},
@@ -1334,6 +1364,25 @@ class CareerSiteTests(unittest.TestCase):
                 job_watcher.workday_fetch("https://acme.wd3.myworkdayjobs.com/wday/cxs/acme/C/jobs")
         self.assertIn("wd3.myworkdayjobs.com", job_watcher._workday_throttled)
         self.assertTrue(job_watcher.is_transient_http_error(http_error(429)))
+
+    def test_workday_detail_429_leaves_the_posting_pending(self):
+        job_watcher._workday_throttled.clear()
+        job_watcher._workday_next_slot.clear()
+        self.addCleanup(job_watcher._workday_throttled.clear)
+        board = {"provider": "workday", "slug": "acme.wd5.myworkdayjobs.com/acme/Careers"}
+        listing = {"total": 1, "jobPostings": [
+            {"title": "Software Engineer", "externalPath": "/job/NYC/SE_R-9", "postedOn": "Posted Today"},
+        ]}
+
+        def fetch(url, data=None):
+            if url.endswith("/jobs"):
+                return listing
+            raise http_error(429)
+
+        with patch("job_watcher.fetch_json", side_effect=fetch), patch("job_watcher.time.sleep"):
+            self.assertEqual(job_watcher.fetch_workday_board(board, now=int(time.time())), [])
+        self.assertEqual(board["_pending_details"], 1)
+        self.assertEqual(board["_listed_ids"], [])  # retried on the next poll
 
     def test_workday_maintenance_page_is_transient(self):
         job_watcher._workday_throttled.clear()

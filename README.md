@@ -118,7 +118,10 @@ after 5, 10, 20 minutes and so on, doubling up to a day; only a board that has
 failed 10 times in a row (about 42 hours) waits a week. Dead boards stop consuming
 the polling budget, while a provider outage of an hour or two can't bench boards for
 a week. Throttling (429) and gateway errors (502, 503, 504) are not counted against
-a board, and neither is a Workday maintenance page (a 200 that is not JSON).
+a board, and neither is a Workday maintenance page (a 200 that is not JSON). Such a
+board was not read, so it stays due and the next run tries it again; a new posting
+whose details were throttled keeps its board on the every-run schedule until it is
+read.
 
 Network errors are not counted against a board. launchd starts a missed run as
 soon as the Mac wakes, often before DNS is back, so each run first waits up to 60

@@ -1546,6 +1546,7 @@ class DetailPlan:
                 jobs.append(job)
         self.board["_listed_ids"] = self.handled
         unprocessed = {job_id for job_id, _ in self.fresh} - set(self.handled)
+        self.board["_pending_details"] = len(unprocessed)
         if unprocessed:
             self.board.pop("_new_etag", None)  # poll the full list again next run
         return jobs
@@ -3494,7 +3495,10 @@ def main() -> int:
                 continue
             board_key = f'{board["provider"]}:{board["slug"]}'
             metric_jobs.setdefault(f'ats:{board["provider"]}', []).extend(direct_jobs)
-            relevant_count = sum(1 for job in direct_jobs if potential_match(job))
+            # A new posting whose details were deferred counts as relevant, so the
+            # board is polled again on the next run rather than in 20 minutes.
+            relevant_count = sum(1 for job in direct_jobs if potential_match(job)) + int(
+                board.get("_pending_details") or 0)
             match_count = sum(1 for job in direct_jobs if matches(job))
             record_board_success(
                 connection, board, relevant_count, match_count, checked_at
@@ -3508,8 +3512,9 @@ def main() -> int:
             initialized_count += int(was_initialized)
         for board in broken_boards:
             record_board_failure(connection, board, checked_at)
-        for board in transient_boards:
-            record_board_unreachable(connection, board, checked_at)
+        # Boards that were throttled or deferred (429, a busy Workday host, 502/503/504,
+        # a maintenance page) were not read, so they stay due and the next run tries
+        # them again, instead of waiting their 20 to 40 minute interval.
         if not outage:
             for board in unreachable_boards:
                 record_board_unreachable(connection, board, checked_at)
@@ -3580,7 +3585,7 @@ def main() -> int:
         f"Selected {len(due_boards)} ATS boards; checked {len(direct_results)} "
         f"({not_modified} unchanged); "
         f"failed {len(failed_boards)} (unreachable {len(unreachable_boards)}"
-        f"{', outage' if outage else ''}; moved {moved_count}); "
+        f"{', outage' if outage else ''}; deferred {len(transient_boards)}; moved {moved_count}); "
         f"aggregators {len(aggregator_results)}; "
         f"feeds {len(feed_results)} (failed {len(failed_feeds)}); "
         f"initialized {initialized_count}; recorded {len(new_jobs)} new matching jobs"
