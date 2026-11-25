@@ -901,9 +901,17 @@ def jittered(seconds: int, board_key: str) -> int:
     return int(seconds * (0.75 + 0.5 * fraction))
 
 
+FAILURE_PARK_COUNT = 10
+FAILURE_PARK_SECONDS = 7 * 24 * 60 * 60
+
+
 def failure_retry_seconds(failure_count: int) -> int:
-    if failure_count >= 3:
-        return 7 * 24 * 60 * 60
+    """Retry a failing board after 5 min, 10 min, 20 min and so on, up to a day. Only a
+    board that has failed for about 42 hours straight is moved to weekly checks. (It
+    used to take 3 failures, so Workday's hour of maintenance pages on 2026-11-21
+    benched 1,273 Workday boards for a week.)"""
+    if failure_count >= FAILURE_PARK_COUNT:
+        return FAILURE_PARK_SECONDS
     return min(5 * 60 * (2 ** max(failure_count - 1, 0)), 24 * 60 * 60)
 
 def select_due_boards(
@@ -1573,6 +1581,13 @@ def workday_fetch(url: str, data: bytes | None = None) -> object:
             with _workday_lock:
                 _workday_throttled.add(host)
         raise
+    except ValueError:
+        # The CXS API answers JSON, or a JSON error for a dead tenant (404, 422).
+        # A 200 that is not JSON is Workday's maintenance page, as across wd1, wd3
+        # and wd5 on 2026-11-21: retry later, without counting it against the board.
+        raise urllib.error.HTTPError(
+            url, 503, "Workday answered with a non-JSON page (maintenance)", None, None
+        ) from None
 
 
 def fetch_workday_board(board: dict, now: int) -> list[dict]:

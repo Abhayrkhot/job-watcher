@@ -398,7 +398,28 @@ class MatchTests(unittest.TestCase):
     def test_failed_boards_retry_with_bounded_backoff(self):
         self.assertEqual(failure_retry_seconds(1), 5 * 60)
         self.assertEqual(failure_retry_seconds(2), 10 * 60)
+        self.assertEqual(failure_retry_seconds(4), 40 * 60)
+        self.assertEqual(failure_retry_seconds(9), 1280 * 60)
+        self.assertEqual(failure_retry_seconds(10), 7 * 24 * 60 * 60)
         self.assertEqual(failure_retry_seconds(20), 7 * 24 * 60 * 60)
+        # A board is moved to weekly checks only after failing for about 42 hours.
+        self.assertEqual(sum(failure_retry_seconds(n) for n in range(1, 10)), 2555 * 60)
+
+    def test_an_hour_long_outage_does_not_bench_a_board_for_a_week(self):
+        # Red Hat on 2026-11-21: four maintenance pages within an hour.
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE board_stats (board_key TEXT PRIMARY KEY, last_checked INTEGER, "
+            "relevant_count INTEGER, match_count INTEGER, failure_count INTEGER)"
+        )
+        board = {"provider": "workday", "slug": "redhat.wd5.myworkdayjobs.com/redhat/jobs"}
+        connection.execute(
+            "INSERT INTO board_stats VALUES (?, 1795245850, 0, 0, 4)",
+            ("workday:redhat.wd5.myworkdayjobs.com/redhat/jobs",),
+        )
+        self.assertEqual(select_due_boards(connection, [board], now=1795245850 + 39 * 60), [])
+        self.assertEqual(select_due_boards(connection, [board], now=1795245850 + 41 * 60), [board])
 
     def test_heartbeat_initializes_on_first_run(self):
         connection = sqlite3.connect(":memory:")
@@ -1163,6 +1184,25 @@ class MainRunTests(unittest.TestCase):
         stats, _ = self.run_main([{"provider": "lever", "slug": "acme"}], fetch_board)
         self.assertEqual(stats["lever:acme"][1], 0)
 
+    def test_workday_maintenance_page_does_not_count_against_the_board(self):
+        job_watcher._workday_throttled.clear()
+        job_watcher._workday_next_slot.clear()
+        read_board = job_watcher.fetch_direct_board
+
+        def fetch_json(url, data=None):
+            if "/redhat/" in url:
+                raise json.JSONDecodeError("Expecting value", "<!DOCTYPE html>", 0)
+            raise http_error(422)  # a dead tenant answers with a JSON error instead
+
+        boards = [
+            {"provider": "workday", "slug": "redhat.wd5.myworkdayjobs.com/redhat/jobs"},
+            {"provider": "workday", "slug": "gone.wd5.myworkdayjobs.com/gone/External"},
+        ]
+        with patch("job_watcher.time.sleep"):
+            stats, _ = self.run_main(boards, read_board, fetch_json)
+        self.assertEqual(stats["workday:redhat.wd5.myworkdayjobs.com/redhat/jobs"][1], 0)
+        self.assertEqual(stats["workday:gone.wd5.myworkdayjobs.com/gone/External"][1], 1)
+
     def test_workday_baseline_then_new_job_is_emailed(self):
         board = {"provider": "workday", "slug": "acme.wd5.myworkdayjobs.com/acme/Careers", "company": "Acme"}
         postings = [{"title": "Software Engineer", "externalPath": "/job/NYC/SE_R-1", "postedOn": "Posted Today"}]
@@ -1294,6 +1334,19 @@ class CareerSiteTests(unittest.TestCase):
                 job_watcher.workday_fetch("https://acme.wd3.myworkdayjobs.com/wday/cxs/acme/C/jobs")
         self.assertIn("wd3.myworkdayjobs.com", job_watcher._workday_throttled)
         self.assertTrue(job_watcher.is_transient_http_error(http_error(429)))
+
+    def test_workday_maintenance_page_is_transient(self):
+        job_watcher._workday_throttled.clear()
+        job_watcher._workday_next_slot.clear()
+        page = json.JSONDecodeError("Expecting value", "<!DOCTYPE html>", 0)
+        with patch("job_watcher.fetch_json", side_effect=page), patch("job_watcher.time.sleep"):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                job_watcher.workday_fetch(
+                    "https://redhat.wd5.myworkdayjobs.com/wday/cxs/redhat/jobs/jobs", b"{}")
+        self.assertEqual(caught.exception.code, 503)
+        self.assertTrue(job_watcher.is_transient_http_error(caught.exception))
+        # Only that board waits; other tenants on the host are still polled this run.
+        self.assertNotIn("wd5.myworkdayjobs.com", job_watcher._workday_throttled)
 
     def test_first_poll_is_a_baseline_without_detail_calls(self):
         board = {"provider": "bamboohr", "slug": "acme", "_baseline": True}
