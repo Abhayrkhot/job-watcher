@@ -123,6 +123,10 @@ def main() -> int:
     in_scope = found - out_of_scope
     print(f"IN-SCOPE RECALL (US roles at companies you have not excluded): "
           f"{reasons['matched']}/{in_scope} = {reasons['matched'] / max(in_scope, 1):.0%}")
+    # Roles that say no sponsorship or need citizenship are rejected on purpose.
+    eligible = in_scope - reasons["no_sponsorship"] - reasons["citizenship_requirement"]
+    print(f"ELIGIBLE RECALL (in scope, and open to a visa holder): "
+          f"{reasons['matched']}/{eligible} = {reasons['matched'] / max(eligible, 1):.0%}")
     for reason, count in reasons.most_common():
         print(f"  {reason:36s}{count:4d}  {count / found:5.1%}")
     for reason in reasons:

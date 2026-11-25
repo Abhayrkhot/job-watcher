@@ -701,6 +701,184 @@ class FilterRecallTests(unittest.TestCase):
         self.assertEqual(rejection_reason(job), "excluded_company")
 
 
+class AlertAuditTests(unittest.TestCase):
+    """Cases from the 2026-11-25 review of three days of emailed alerts."""
+
+    def job(self, description, title="Software Engineer I", locations=None):
+        return {"title": title, "description": description, "company_name": "Acme",
+                "locations": ["Austin, TX"] if locations is None else locations,
+                "active": True, "is_visible": True, "posted_at": int(time.time()) - 600}
+
+    def reason(self, description, title="Software Engineer I"):
+        return rejection_reason(self.job(description, title))
+
+    def test_rejects_postings_that_will_not_sponsor(self):
+        for description in [
+            "Visa sponsorship is not available for this position.",
+            "Toyota does not offer support or sponsorship of job applicants for employment-based "
+            "visas. You should not apply for this role if you will require Toyota to assist with "
+            "immigration support or sponsorship now or in the future.",
+            "Must be legally authorized to work in the United States without the need for employer "
+            "sponsorship, now or at any time in the future.",
+            "Must be presently authorized to work in the U.S. without a requirement for work "
+            "authorization sponsorship by our company.",
+            "At this time, we are unable to offer employment for individuals located outside of the "
+            "United States and/or those who require sponsorship for employment visa status (e.g., H-1B).",
+            "**No sponsorship offered for this position**",
+            "The Company will not sponsor applicants for work visas for this position.",
+            "Unable to sponsor or transfer H-1B visas currently.",
+            "Veeva does not provide sponsorship for employment visa status (e.g., H-1B, OPT, or TN status).",
+            "Employer is unable to provide visa sponsorship for employment, or support STEM OPT.",
+            "U.S. work authorization required (no visa sponsorship provided)",
+            "We are not able to sponsor visas at this time.",
+        ]:
+            with self.subTest(description=description[:50]):
+                self.assertEqual(self.reason(description), "no_sponsorship")
+
+    def test_keeps_postings_that_sponsor_or_say_nothing(self):
+        for description in [
+            "Visa sponsorship: We do sponsor visas! However, we aren't able to successfully "
+            "sponsor visas for every role and every candidate.",
+            "Visa sponsorship is available, including O-1A, H-1B transfer, and TN support.",
+            "We help with relocation and support H-1B transfers.",
+            "We are pleased to offer visa sponsorship for eligible and qualified individuals.",
+            "Will you, now or in the future, require sponsorship for employment in the U.S.? Yes No",
+            "No sponsorship information provided.",
+            "Employees are covered under Smartsheet-sponsored life insurance.",
+            "Company sponsored events and game nights. Legally eligible to work in the U.S.",
+        ]:
+            with self.subTest(description=description[:50]):
+                self.assertEqual(self.reason(description), "matched")
+
+    def test_sponsorship_filter_can_be_turned_off(self):
+        with patch("job_watcher.FILTER_NO_SPONSORSHIP", False):
+            self.assertEqual(self.reason("Visa sponsorship is not available."), "matched")
+
+    def test_rejects_clearance_and_us_person_requirements(self):
+        for description in [
+            "Required Qualifications: TS/SCI with Full Scope Polygraph",
+            "Clearance: Active DoD Secret. Employment Type: Full-time",
+            "Clearance Requirements TS Clearance with Customer Appropriate Polygraph",
+            "Due to federal contract requirements, United States Citizenship and "
+            "position-appropriate security clearance are required.",
+            "Due to ITAR regulations, this role is only open to U.S. Citizens, lawful permanent "
+            "residents (green card holders) or foreign nationals granted refugee or asylee status.",
+            "We are required to ensure that such access is provided only to individuals who are "
+            "classified as 'U.S. Persons.'",
+            "Must be able to obtain and maintain a Public Trust clearance.",
+            "Must be able to obtain and maintain the required customer clearance for access to systems.",
+        ]:
+            with self.subTest(description=description[:50]):
+                self.assertEqual(self.reason(description), "citizenship_requirement")
+
+    def test_keeps_clearance_lookalikes(self):
+        for description in [
+            "Understand the customer's security objectives, current secret stores, and deployment model.",
+            "Candidates must be able to comply with U.S. export control regulations, which may include "
+            "meeting the definition of a U.S. Person where required.",
+            "Do you currently hold an active Secret or Top Secret clearance? Yes No",
+            "Our mission is to earn the public trust in AI.",
+        ]:
+            with self.subTest(description=description[:50]):
+                self.assertEqual(self.reason(description), "matched")
+
+    def test_years_in_one_bullet_are_not_cancelled_by_another(self):
+        for description in [
+            "<p>Requirements</p><ul><li>Experience: 4+ years in a technical, customer-facing "
+            "engineering role, ideally at a fast-growing company.</li></ul>",
+            "<ul><li>CISSP, CCSP, or GIAC security certification preferred</li>"
+            "<li>A minimum of 3 years of security experience</li></ul>",
+            "<ul><li>3+ years of experience in data analytics, ideally including revenue reporting."
+            "</li><li>Tableau is a plus</li></ul>",
+            "What You Need Minimum 5+ years of experience shipping architectures for critical "
+            "systems preferred",
+            "A bachelor's degree in a technical discipline and three (3) years of experience.",
+            "No bachelor's degree with eleven (11) years of qualifying experience.",
+        ]:
+            with self.subTest(description=description[:50]):
+                text = job_watcher.plain_text(description)
+                self.assertEqual(self.reason(text), "too_much_experience")
+
+    def test_years_that_are_not_a_requirement(self):
+        for description in [
+            "Bachelor's degree with zero (0) to two (2) years of professional experience.",
+            "One to three years of experience building and shipping production software, ideally "
+            "at an early-stage startup.",
+            "Bachelor's in Computer Science, Data Science, or relevant STEM certification; or 4 years "
+            "of equivalent experience.",
+            "Bachelor's degree or a minimum of 5 years' experience developing software applications.",
+            "4 years of experience may be substituted for a bachelor's degree.",
+            "Bachelor's degree from an accredited 4 year university with a 3.0 GPA. Must have taken C.S. classes.",
+            "The team has tripled in size within the last five (5) years.",
+            "Experience: Less than 3 years prior related experience.",
+            "You don't need to be an experienced software engineer.",
+            "How many years of work experience do you have? * Please Select 0 - 1 Years 1 - 2 Years "
+            "2 - 3 Years 3 - 4 Years 4 - 7 Years 7 - 15 Years",
+            "Basic Qualifications - Are 18 years of age or older - Experience in HTML, CSS, or JavaScript",
+        ]:
+            with self.subTest(description=description[:50]):
+                self.assertEqual(self.reason(description), "matched")
+
+    def test_each_figure_keeps_its_own_cue(self):
+        # "2 years required" counts even though "4 years preferred" follows it.
+        self.assertEqual(job_watcher.required_years("Experience: 2 years required/ 4 years preferred"), 2)
+        self.assertIsNone(job_watcher.required_years("3+ years of Go experience is a plus."))
+
+    def test_plain_text_keeps_bullets_on_their_own_lines(self):
+        self.assertEqual(
+            job_watcher.plain_text("<ul><li>Python</li><li>3+ years&nbsp;of Go</li></ul><p>Apply</p>"),
+            "Python\n3+ years of Go\nApply",
+        )
+        self.assertEqual(job_watcher.plain_text("Software <b>Engineer</b>"), "Software Engineer")
+
+    @patch("job_watcher.fetch_json")
+    def test_lever_reads_requirement_lists(self, fetch_json):
+        fetch_json.return_value = [{
+            "id": "abc", "text": "IT Infrastructure Engineer II", "hostedUrl": "https://jobs.lever.co/acme/abc",
+            "createdAt": int(time.time() * 1000) - 60_000,
+            "categories": {"location": "Broomfield, CO"}, "country": "US",
+            "descriptionPlain": "Join our team.",
+            "lists": [{"text": "YOU MUST HAVE:", "content": "<li>Bachelor's degree</li>"
+                       "<li>3–5 years’ experience across systems</li>"}],
+            "additionalPlain": "Benefits.",
+        }]
+        _, jobs = fetch_direct_board({"provider": "lever", "slug": "acme"})
+        self.assertIn("3–5 years", jobs[0]["description"])
+        self.assertEqual(rejection_reason(jobs[0]), "too_much_experience")
+
+    def test_simplify_does_not_offer_sponsorship_label(self):
+        now = int(time.time())
+        jobs = job_watcher.simplify_jobs([{
+            "id": "a", "category": "Software", "date_posted": now - 600,
+            "title": "Software Engineer, New Grad", "company_name": "Acme", "locations": ["Austin, TX"],
+            "url": "https://careers.acme.com/1", "active": True, "sponsorship": "Does Not Offer Sponsorship",
+        }], now)
+        self.assertEqual(rejection_reason(jobs[0]), "no_sponsorship")
+
+    def test_simplify_copies_of_directly_read_boards_are_dropped(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE initialized_boards (board_key TEXT PRIMARY KEY, initialized_at TEXT)")
+        connection.execute("CREATE TABLE board_stats (board_key TEXT PRIMARY KEY, last_checked INTEGER, "
+                           "relevant_count INTEGER, match_count INTEGER, failure_count INTEGER)")
+        now = int(time.time())
+        old = datetime.fromtimestamp(now - 10 * 86400, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        new = datetime.fromtimestamp(now - 3600, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        connection.executemany("INSERT INTO initialized_boards VALUES (?, ?)", [
+            ("smartrecruiters:AbbVie", old), ("greenhouse:fresh", new), ("lever:broken", old),
+        ])
+        connection.execute("INSERT INTO board_stats VALUES ('lever:broken', 0, 0, 0, 3)")
+        jobs = [{"url": url, "posted_at": now - 600} for url in (
+            "https://jobs.smartrecruiters.com/AbbVie/3743990017034256",  # read directly: dropped
+            "https://job-boards.greenhouse.io/fresh/jobs/1",  # board baselined after posting
+            "https://jobs.lever.co/broken/abc",  # board failing, so Simplify is the only path
+            "https://jobs.lever.co/unknown/abc",  # board not in the registry yet
+            "https://careers.example.com/jobs/1",  # an ATS the watcher cannot read
+        )]
+        kept = job_watcher.without_direct_duplicates(connection, jobs)
+        self.assertEqual([job["url"] for job in kept], [job["url"] for job in jobs[1:]])
+
+
 def http_error(code: int) -> urllib.error.HTTPError:
     return urllib.error.HTTPError("https://example.com", code, "error", None, None)
 

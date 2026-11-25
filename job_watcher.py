@@ -59,6 +59,9 @@ HEARTBEAT_EXPECTED_SECONDS = 5 * 60
 HEARTBEAT_GRACE_SECONDS = 10 * 60
 MAX_JOB_AGE_SECONDS = 24 * 60 * 60
 FUTURE_TIMESTAMP_GRACE_SECONDS = 5 * 60
+# Postings that say they will not sponsor a work visa are dropped. Set
+# JOB_WATCHER_KEEP_NO_SPONSORSHIP=1 to keep them.
+FILTER_NO_SPONSORSHIP = os.environ.get("JOB_WATCHER_KEEP_NO_SPONSORSHIP") != "1"
 SUPPORTED_PROVIDERS = {
     "ashby", "greenhouse", "lever", "lever-eu", "recruitee", "smartrecruiters",
     "workable", "workday", "oracle", "bamboohr", "rippling", "jobvite", "jazzhr",
@@ -189,6 +192,9 @@ DEFAULT_EXCLUDED_COMPANIES = (
     "Joby Aviation", "Archer Aviation", "Boom Supersonic", "Varda Space", "K2 Space",
     "Apex Space", "Vast", "Shield", "f7d8749a-72d6-407c-bf98-292ea630c73a",
     "Fantom Corporation", "Graham Capital Management", "Grahamcapitalmanagement", "Amentum",
+    # intelligence and defense contractors whose roles need a clearance
+    "Wyetech", "Agile Defense", "Agiledefense", "BTI360", "Bti36021", "GRVTY",
+    "Freedom Consulting Group", "Freedomconsulting", "Anavation", "Anavationllc",
 )
 EXCLUDED_COMPANIES_PATH = STATE_DIR / "excluded_companies.json"
 US_STATE_CODES = (
@@ -268,16 +274,108 @@ CITIZENSHIP_REQUIREMENT_RE = re.compile(
     rf"|\b(?:active|current)\s+(?:(?:top\s+)?secret|ts/sci|security|government)\s+clearance\b"
     rf"|\b(?:ability|able)\s+to\s+(?:obtain|acquire|get)\s+(?:and\s+maintain\s+)?"
     rf"(?:a\s+|an\s+)?(?:{_US}\s+)?(?:government\s+)?(?:security\s+)?clearance\b"
-    rf"|\bmust\s+be\s+(?:a\s+)?{_US}\s+persons?\b|\b{_US}\s+person\s+(?:status\s+)?(?:is\s+)?required\b",
+    rf"|\bmust\s+be\s+(?:a\s+)?{_US}\s+persons?\b|\b{_US}\s+person\s+(?:status\s+)?(?:is\s+)?required\b"
+    # Clearances and the programs that imply them ("TS/SCI with Full Scope Polygraph",
+    # "Active DoD Secret", "TS Clearance", "Public Trust clearance").
+    rf"|\bts\s*/\s*sci\b|\btop\s+secret\b|\bpolygraph\b|\b(?:full[- ]scope|ci)\s+poly\b|\+\s*poly\b"
+    rf"|\bts\s+clearance\b"
+    rf"|\b(?:active|current)\s+(?:(?:dod|doe|dhs|u\.?s\.?|government|federal)\s+){{1,2}}secret\b"
+    rf"|\b(?:active|current)\s+secret\s+(?:clearance|level|or\s+higher)\b"
+    rf"|\bpublic\s+trust\s+(?:clearance|position|investigation|suitability|background|level|eligib)"
+    rf"|\b(?:obtain|maintain|hold|possess)\s+(?:and\s+maintain\s+)?(?:a\s+|an\s+)?(?:active\s+)?public\s+trust\b"
+    rf"|\b(?:ability|able|eligible)\s+to\s+(?:obtain|acquire|get)\s+(?:and\s+maintain\s+)?"
+    rf"(?:a\s+|an\s+|the\s+)?(?:required\s+)?(?:customer\s+|government\s+|federal\s+|dod\s+)?"
+    rf"(?:security\s+)?clearance\b"
+    # "United States Citizenship and position-appropriate security clearance are required"
+    rf"|\b{_US}\s+citizenship\b[^.;?]{{0,80}}?\b(?:is|are)\s+required\b"
+    # ITAR and export control: "only open to U.S. Citizens", "only to U.S. Persons"
+    rf"|\b(?:only|exclusively)\s+(?:be\s+)?(?:open|available)\s+to\s+(?:{_US}\s+)?citizens\b"
+    rf"|\b(?:only|must|required|limited)\b[^.;?]{{0,80}}?\b{_US}\s+persons?\b"
+    rf"|\b{_US}\s+persons?\b[^.;?]{{0,40}}?\b(?:only|required)\b"
+    rf"|\btemporary\s+visas?\b[^.;?]{{0,120}}?\b(?:not|in)eligible",
     re.I,
 )
-WORD_NUMBERS = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-}
+# Work authorization without sponsorship. A posting that says so rules out anyone
+# on a student visa, OPT or an H-1B, so it is rejected like a citizenship rule.
+_SPONSOR = r"(?:visa\s+|immigration\s+|employment\s+|work\s+|h-?1b\s+)?sponsor(?:ship|s|ing)?\b"
+_SPONSOR_NEGATION = (
+    r"(?:does not|do not|did not|will not|would not|cannot|can not|can't|won't|doesn't|"
+    r"don't|is not|are not|isn't|unable to|not able to|no longer|not currently|"
+    r"not in a position to)"
+)
+NO_SPONSORSHIP_RE = re.compile(
+    # "does not offer support or sponsorship", "unable to provide visa sponsorship"
+    rf"\b{_SPONSOR_NEGATION}\s+(?:(?!require|need)[\w/-]+\s+){{0,4}}?{_SPONSOR}"
+    # "Visa sponsorship is not available", "sponsorship will not be provided"
+    rf"|\b{_SPONSOR}\s*(?:is|are|will)?\s*(?:not|un)\s*(?:be\s+)?"
+    rf"(?:available|offered|provided|possible|supported|considered)"
+    # "No sponsorship offered" (but not "no sponsorship information" or "no sponsorship needed")
+    rf"|\bno\s+{_SPONSOR}(?!\s+(?:is\s+)?(?:required|needed|necessary|information|info|details|"
+    rf"mention|language|data)\b)"
+    # "without the need for employer sponsorship", "without current or future sponsorship"
+    rf"|\bwithout\s+(?:the\s+|a\s+)?(?:(?:need|requirement)\s+(?:for|of)\s+)?(?:[\w/-]+\s+){{0,4}}?{_SPONSOR}"
+    rf"|\bnot\s+(?:be\s+)?eligible\s+for\s+(?:[\w/-]+\s+){{0,2}}?{_SPONSOR}"
+    # "must not require sponsorship", "and not require Toyota support or sponsorship"
+    rf"|\b(?:must|should|and|who do|will)\s+not\s+(?:now\s+or\s+in\s+the\s+future\s+)?"
+    rf"(?:require|need)\b[^.;?]{{0,50}}?\bsponsor"
+    # "unable to offer employment to ... those who require sponsorship"
+    rf"|\b{_SPONSOR_NEGATION}\s+(?:\w+\s+){{0,3}}?(?:hire|employ|consider|offer employment)\b"
+    rf"[^.;?]{{0,120}}?\b(?:require|need)s?\b[^.;?]{{0,40}}?\bsponsor"
+    rf"|\b{_SPONSOR}\s*:\s*(?:no|none|not available|unavailable)\b"
+    rf"|\bunable to (?:sponsor|transfer)\b",
+    re.I,
+)
+SPONSORSHIP_OFFERED_RE = re.compile(
+    rf"\b(?:we|company|employer)\s+(?:do|does|will|can|may|are able to|is able to)\s+(?:also\s+)?sponsor"
+    rf"|\b{_SPONSOR}\s+(?:is\s+|may\s+be\s+)?(?:available|offered|provided|supported)\b"
+    rf"|\b(?:offer|offers|provide|provides)\s+(?:\w+\s+){{0,2}}?{_SPONSOR}"
+    rf"|\bsupport\s+h-?1b\b|\bh-?1b\s+transfers?\s+(?:are\s+)?(?:welcome|supported)",
+    re.I,
+)
+NEGATED_BEFORE_RE = re.compile(r"(?:\b(?:not|no|unable|cannot|never|without)\b|n't)[^.;?]{0,30}$", re.I)
+FORM_QUESTION_RE = re.compile(r"[^.!;\n]*\?")
+_WORD_NUMBER_NAMES = (
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen"
+).split()
+WORD_NUMBERS = {name: value for value, name in enumerate(_WORD_NUMBER_NAMES)}
+_NUMBER = rf"\d{{1,2}}|{'|'.join(_WORD_NUMBER_NAMES)}"
 YEARS_RE = re.compile(
-    r"\b(?P<low>\d{1,2}|zero|one|two|three|four|five|six|seven|eight|nine|ten)\s*"
-    r"(?:\+|plus)?\s*(?:(?:-|–|to)\s*(?P<high>\d{1,2})\s*\+?\s*)?(?:years?|yrs?)\b",
+    rf"\b(?P<low>{_NUMBER})\s*"
+    rf"(?:\+|plus)?\s*(?:(?:-|–|to)\s*(?P<high>{_NUMBER})\s*\+?\s*)?(?:years?|yrs?)\b",
+    re.I,
+)
+# "three (3) years" and "3 (three) years" read as "3 years".
+PAREN_NUMBER_RE = re.compile(
+    rf"\b(?:(?:{'|'.join(_WORD_NUMBER_NAMES)})\s*\((\d{{1,2}})\+?\)|(\d{{1,2}})\s*\((?:{'|'.join(_WORD_NUMBER_NAMES)})\))",
+    re.I,
+)
+# Cues read around each figure, not across the whole sentence, so "ideally at a
+# startup" after "4+ years ..." does not make the years optional.
+SOFT_BEFORE_RE = re.compile(
+    r"(?:\b(?:preferred|nice[- ]to[- ]have|bonus(?: points)?|desired|desirable|a plus)\b[^.;]{0,30}"
+    r"|\b(?:ideally|preferably|optionally)\b[^.;,]{0,15})$",
+    re.I,
+)
+SOFT_AFTER_RE = re.compile(
+    r"\b(?:preferred|preferable|(?:is|are|a|big)\s+plus|nice[- ]to[- ]have|desired|desirable|bonus)\b",
+    re.I,
+)
+HARD_BEFORE_RE = re.compile(
+    r"\b(?:minimum(?:\s+of)?|at\s+least|required|requires?|must\s+have|needs?)\s*:?\s*"
+    r"(?:a\s+)?(?:minimum\s+of\s+)?$",
+    re.I,
+)
+HARD_AFTER_RE = re.compile(r"^\s*(?:of\s+[^.;]{0,60}?)?\b(?:is\s+|are\s+)?(?:required|mandatory)\b", re.I)
+# Figures that are not an experience requirement: "less than 3 years", "within the
+# last five years", "after 3 years", "a 4 year university", "18 years of age".
+NOT_A_REQUIREMENT_BEFORE_RE = re.compile(
+    r"\b(?:less than|fewer than|under|up to|no more than|at most|maximum of|after|every|each|"
+    r"(?:within|in|during|for)\s+(?:the\s+|your\s+)?(?:past|last|next|first|initial))\s*$",
+    re.I,
+)
+NOT_A_REQUIREMENT_AFTER_RE = re.compile(
+    r"^[\s-]*(?:old\b|of age\b|in a row\b|in business\b|(?:accredited\s+)?"
+    r"(?:college|university|degree|bachelor|program|institution|school)\b)",
     re.I,
 )
 REQUIREMENT_CUE_RE = re.compile(
@@ -288,7 +386,7 @@ COMPANY_HISTORY_RE = re.compile(
     r"(?:over|more than|nearly|almost|for (?:the )?(?:past|last)|around for|in business for|"
     r"founded|since|history of)\s*$", re.I
 )
-_N = r"(\d{1,2}|zero|one|two|three|four|five|six|seven|eight|nine|ten)"
+_N = rf"({_NUMBER})"
 # Tiered requirements ("BS + 6 years OR MS + 5 years OR PhD"): the Master's path applies.
 MASTERS_YEARS_RE = re.compile(
     rf"\b(?:master'?s|ms|m\.s\.|msc)\b[^.;]{{0,60}}?\b{_N}\s*\+?\s*(?:years?|yrs)\b"
@@ -296,7 +394,11 @@ MASTERS_YEARS_RE = re.compile(
     rf"(?:master'?s|ms|m\.s\.)\b",
     re.I,
 )
-DEGREE_OR_YEARS_RE = re.compile(rf"\bdegree\b[^.;]{{0,80}}?\bor\s+{_N}\s*\+?\s*(?:years?|yrs)", re.I)
+DEGREE_OR_YEARS_RE = re.compile(
+    rf"\bdegree\b[^.;]{{0,80}}?\bor\s+(?:a\s+)?(?:minimum\s+of\s+|at\s+least\s+)?{_N}\s*\+?\s*(?:years?|yrs)"
+    r"|\b(?:may|can)\s+be\s+substituted\b|\bin\s+lieu\s+of\s+(?:a\s+|the\s+)?(?:\w+\s+){0,2}?degree\b",
+    re.I,
+)
 MASTERS_ALTERNATIVE_RE = re.compile(
     r"\b(?:or|with)\s+(?:an?\s+|the\s+)?(?:master'?s|ms|m\.s\.|mba|ph\.?d\.?|doctorate|"
     r"graduate degree|advanced degree)\b",
@@ -453,9 +555,36 @@ def is_us_location(locations: list[str], description: str | None = None) -> bool
     return bool(description and US_REMOTE_EVIDENCE_RE.search(description))
 
 
+def stated_matches(pattern: re.Pattern, text: str):
+    """Matches that are statements, skipping application-form questions such as
+    "Will you now or in the future require sponsorship?"."""
+    for match in pattern.finditer(text):
+        if not FORM_QUESTION_RE.match(text, match.end(), match.end() + 200):
+            yield match
+
+
 def description_mentions_citizenship_requirement(description: str) -> bool:
     """False when the posting requires citizenship, a US-person status or a clearance."""
-    return not CITIZENSHIP_REQUIREMENT_RE.search(description or "")
+    text = description or ""
+    for match in stated_matches(CITIZENSHIP_REQUIREMENT_RE, text):
+        # "which may include meeting the definition of a U.S. Person" is a maybe.
+        if not re.search(r"\bmay\b", text[max(0, match.start() - 60): match.end()], re.I):
+            return False
+    return True
+
+
+def refuses_sponsorship(description: str) -> bool:
+    """True when the posting says it will not sponsor a work visa ("Visa sponsorship
+    is not available", "must be authorized to work without sponsorship"), unless it
+    also says it does sponsor ("We do sponsor visas!")."""
+    text = description or ""
+    if next(stated_matches(NO_SPONSORSHIP_RE, text), None) is None:
+        return False
+    offered = (
+        match for match in SPONSORSHIP_OFFERED_RE.finditer(text)
+        if not NEGATED_BEFORE_RE.search(text[max(0, match.start() - 40): match.start()])
+    )
+    return next(offered, None) is None
 
 
 def potential_match(job: dict) -> bool:
@@ -474,8 +603,9 @@ def requirement_sentences(text: str):
     """Yield (sentence, optional) pairs. Text under a "Preferred qualifications",
     "Nice to have" or similar header is optional until the next required header,
     even when the posting runs its sections together without periods."""
+    text = PAREN_NUMBER_RE.sub(lambda m: m.group(1) or m.group(2), text or "")
     marked = SECTION_HEADER_RE.sub(
-        lambda m: ("\n\u0001" if m.group("optional") else "\n\u0002") + m.group(0), text or ""
+        lambda m: ("\n\u0001" if m.group("optional") else "\n\u0002") + m.group(0), text
     )
     optional = False
     for sentence in SENTENCE_SPLIT_RE.split(marked):
@@ -490,20 +620,32 @@ def requirement_sentences(text: str):
 
 def sentence_required_years(sentence: str, strict_cues: bool = False) -> int | None:
     """Years a sentence demands of a Master's new grad, or None if it demands none."""
-    if PREFERRED_CUE_RE.search(sentence) or SEPARATE_TRACK_RE.search(sentence):
-        return None
+    if SEPARATE_TRACK_RE.search(sentence) or sentence.rstrip().endswith("?"):
+        return None  # another track, or an application question
     masters = MASTERS_YEARS_RE.search(sentence)
-    if masters:
+    if masters and not PREFERRED_CUE_RE.search(sentence):
         return _number(next(group for group in masters.groups() if group))
     if DEGREE_OR_YEARS_RE.search(sentence) or MASTERS_ALTERNATIVE_RE.search(sentence):
         return None  # the degree on its own qualifies
     years, cued = [], []
-    for match in YEARS_RE.finditer(sentence):
+    figures = list(YEARS_RE.finditer(sentence))
+    if re.match(r"^\W*or\b", sentence, re.I) or len(figures) >= 4:
+        return None
+    for index, match in enumerate(figures):
         low = _number(match.group("low"))
         high = match.group("high")
-        if low > 15 or COMPANY_HISTORY_RE.search(sentence[max(0, match.start() - 30): match.start()]):
+        start, end = match.start(), match.end()
+        before = sentence[max(0, start - 45): start]
+        following = figures[index + 1].start() if index + 1 < len(figures) else len(sentence)
+        # "2 years required/ 4 years preferred": each figure keeps its own cue.
+        after = re.split(r"[/|]", sentence[end: min(following, end + 100)], maxsplit=1)[0]
+        if (low > 15 or COMPANY_HISTORY_RE.search(sentence[max(0, start - 30): start])
+                or NOT_A_REQUIREMENT_BEFORE_RE.search(before) or NOT_A_REQUIREMENT_AFTER_RE.match(after)):
             continue
-        if high and low == 2 and int(high) <= 3:
+        hard = HARD_BEFORE_RE.search(sentence[max(0, start - 25): start]) or HARD_AFTER_RE.match(after)
+        if not hard and (SOFT_BEFORE_RE.search(before) or SOFT_AFTER_RE.search(after)):
+            continue  # "3+ years ... is a plus", "ideally 2 years"
+        if high and low == 2 and _number(high) <= 3:
             low = 1  # "2-3 years" is a junior band
         phrase = match.group(0)
         window = sentence[max(0, match.start() - 50): match.end() + 80]
@@ -540,9 +682,16 @@ def asks_for_too_much_experience(text: str, title: object = "") -> bool:
         if years == 2 and not new_grad_title:
             return True
     return any(
-        SENIOR_PHRASE_RE.search(sentence) and not optional and not PREFERRED_CUE_RE.search(sentence)
+        asks_for_seniority(sentence) and not optional and not PREFERRED_CUE_RE.search(sentence)
         for sentence, optional in requirement_sentences(text)
     )
+
+
+def asks_for_seniority(sentence: str) -> bool:
+    match = SENIOR_PHRASE_RE.search(sentence)
+    if not match or sentence.rstrip().endswith("?"):  # "How many years ... do you have?"
+        return False
+    return not NEGATED_BEFORE_RE.search(sentence[max(0, match.start() - 40): match.start()])
 
 
 def matches(job: dict) -> bool:
@@ -572,6 +721,8 @@ def rejection_reason(job: dict, now: int | None = None) -> str:
         return "outside_us"
     if not description_mentions_citizenship_requirement(description):
         return "citizenship_requirement"
+    if FILTER_NO_SPONSORSHIP and refuses_sponsorship(description):
+        return "no_sponsorship"
     return "matched"
 
 
@@ -878,9 +1029,17 @@ def wait_for_network(
     return True
 
 
+# Block-level tags end a line, so each bullet of a requirements list stays its own
+# sentence. Flattened into one line, a "nice to have" in one bullet used to cancel
+# the "5+ years" in the bullet next to it.
+BLOCK_TAG_RE = re.compile(r"<\s*(?:br|li|/li|/p|/div|/h[1-6]|/tr|/ul|/ol|/section)\b[^>]*>", re.I)
+
+
 def plain_text(value: str) -> str:
     decoded = html.unescape(html.unescape(value or ""))
-    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", decoded)).strip()
+    text = re.sub(r"<[^>]+>", " ", BLOCK_TAG_RE.sub("\n", decoded))
+    text = re.sub(r"[^\S\n]+", " ", text)
+    return re.sub(r"\s*\n\s*", "\n", text).strip()
 
 
 def parse_job_datetime(value: object) -> int | None:
@@ -1156,9 +1315,16 @@ def read_board(board: dict) -> list[dict]:
             locations = categories.get("allLocations") or [categories.get("location", "")]
             if item.get("country") == "US":
                 locations = [*locations, "United States"]
-            description = " ".join(filter(None, [
+            # Requirements ("Qualifications", "What you'll need") live in `lists`,
+            # not in descriptionPlain.
+            sections = [
+                f'{section.get("text", "")}\n{plain_text(str(section.get("content", "")))}'
+                for section in item.get("lists") or [] if isinstance(section, dict)
+            ]
+            description = "\n".join(filter(None, [
                 str(item.get("openingPlain", "")),
                 str(item.get("descriptionPlain", "")),
+                *sections,
                 str(item.get("additionalPlain", "")),
             ]))
             normalized.append(direct_job(
@@ -1731,6 +1897,10 @@ HARVEST_CATEGORIES = {
 HARVEST_MAX_AGE_SECONDS = 365 * 24 * 60 * 60
 LOCALE_SEGMENT_RE = re.compile(r"^[a-z]{2}(?:-[A-Za-z]{2})?$")
 SIMPLIFY_CITIZENSHIP = "U.S. Citizenship is Required"
+SIMPLIFY_SPONSORSHIP_TEXT = {
+    SIMPLIFY_CITIZENSHIP: "U.S. citizenship is required.",
+    "Does Not Offer Sponsorship": "Visa sponsorship is not available.",
+}
 
 
 def board_from_url(url: str, company: str = "") -> dict | None:
@@ -1840,15 +2010,46 @@ def simplify_jobs(listings: list[dict], now: int) -> list[dict]:
             "company_name": str(listing.get("company_name") or ""),
             "locations": [str(value) for value in listing.get("locations") or []],
             "url": str(listing.get("url") or ""),
-            "description": (
-                "U.S. citizenship is required." if listing.get("sponsorship") == SIMPLIFY_CITIZENSHIP else ""
-            ),
+            "description": SIMPLIFY_SPONSORSHIP_TEXT.get(str(listing.get("sponsorship") or ""), ""),
             "posted_at": posted,
             "posted_precision": "listed",
             "active": bool(listing.get("active", True)),
             "is_visible": bool(listing.get("is_visible", True)),
         })
     return jobs
+
+
+SIMPLIFY_DUPLICATE_MARGIN_SECONDS = 24 * 60 * 60
+
+
+def without_direct_duplicates(connection: sqlite3.Connection, jobs: list[dict]) -> list[dict]:
+    """Drop Simplify copies of jobs on boards the watcher already reads in full.
+
+    A Simplify listing has no description, so a copy of a posting that the direct
+    reader rejected (5+ years, no sponsorship, clearance) would otherwise be mailed.
+    A copy is dropped only when its board was baselined well before the listing
+    (so the direct reader saw the job as new) and the board is reading cleanly.
+    """
+    baselined = {
+        key.lower(): int(stamp or 0) for key, stamp in connection.execute(
+            "SELECT board_key, strftime('%s', initialized_at) FROM initialized_boards"
+        )
+    }
+    failing = {
+        key.lower() for (key,) in connection.execute(
+            "SELECT board_key FROM board_stats WHERE failure_count > 0"
+        )
+    }
+    kept = []
+    for job in jobs:
+        board = board_from_url(job.get("url", ""))
+        key = registry_key(board) if board else ""
+        since = baselined.get(key)
+        if (since is not None and key not in failing
+                and since < int(job.get("posted_at") or 0) - SIMPLIFY_DUPLICATE_MARGIN_SECONDS):
+            continue
+        kept.append(job)
+    return kept
 
 
 def fetch_conditional(connection: sqlite3.Connection, url: str) -> bytes | None:
@@ -1892,7 +2093,9 @@ def fetch_simplify(
                 listings = json.loads(body)
                 new_boards += harvest_boards(listings, known, now)
                 if name == "simplify-newgrad":
-                    results.append(("simplify", simplify_jobs(listings, now)))
+                    results.append(("simplify", without_direct_duplicates(
+                        connection, simplify_jobs(listings, now)
+                    )))
         except Exception as exc:
             print(f"Simplify source failed ({name}): {exc}", file=sys.stderr)
         finally:

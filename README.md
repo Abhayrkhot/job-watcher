@@ -27,25 +27,43 @@ disqualifiers:
   is a requirement even without the word "experience". A posting is rejected for
   3+ years, or for 2+ years without a new-grad title; "2-3 years" counts as a
   junior band. In tiered wording ("BS + 6 years or MS + 5 years or PhD") the
-  Master's path is the one that counts. "Degree or 4 years", "including
+  Master's path is the one that counts. "Degree or 4 years", "or a minimum of 5
+  years" after a degree, "may be substituted for a degree", "including
   internships", and anything under a "Preferred", "Nice to have", or
-  "Considerations for top candidates" header don't count. "Mid-level", "several
-  years", "proven track record", and "deep expertise in ..." reject.
+  "Considerations for top candidates" header don't count. A "preferred", "a plus",
+  or "ideally" counts only next to its own figure: in "4+ years in a customer-facing
+  role, ideally at a startup" the 4 years still count, and "Minimum 5+ years ...
+  preferred" counts. HTML bullets stay separate sentences, so a "nice to have" in one
+  bullet never cancels the years in the next. "Three (3) years" reads as 3; "less
+  than 3 years", "within the last five years", "a 4 year university", "18 years of
+  age", and application-form questions are not requirements. "Mid-level", "several
+  years", "proven track record", and "deep expertise in ..." reject, unless negated
+  ("you don't need to be an experienced engineer").
 - **Location**: US only. The posting needs a US city, state, or "United States"
   in its location. A bare "Remote" or blank location is kept only when the
   description itself says US (for example "authorized to work in the U.S." or US
   time zones). A role open in both the US and Canada is kept; country codes such
   as "IN" or "IND" next to an Indian city are not read as US states.
 - **Work authorization**: rejected when it requires U.S. citizenship, permanent
-  residency, U.S.-person status, or a security clearance. Equal-opportunity text
-  about "citizenship status" is not a requirement.
-- **Companies**: prop and quant trading, ByteDance/TikTok, and aerospace/defense are
-  excluded by default. Put a JSON list of names in `state/excluded_companies.json`
+  residency, U.S.-person status (ITAR, "only open to U.S. citizens"), or a
+  clearance (TS/SCI, polygraph, "Active DoD Secret", Public Trust). Equal-opportunity
+  text about "citizenship status" is not a requirement, and "may include meeting the
+  definition of a U.S. person" is a maybe, not a rule.
+- **Sponsorship**: rejected when the posting says it will not sponsor a work visa
+  ("Visa sponsorship is not available", "must be authorized to work without the need
+  for employer sponsorship", "will not sponsor applicants"), unless it also says it
+  does sponsor ("We do sponsor visas!", "support H-1B transfers"). Application-form
+  questions such as "Will you require sponsorship?" are ignored. Set
+  `JOB_WATCHER_KEEP_NO_SPONSORSHIP=1` in `.env` to keep these postings.
+- **Companies**: prop and quant trading, ByteDance/TikTok, aerospace/defense, and
+  intelligence contractors whose roles need a clearance are excluded by default. Put a JSON list of names in `state/excluded_companies.json`
   to replace the default list.
 
 `python3 tools/eval_filter.py` measures the filter against SimplifyJobs' curated
 new-grad list. It fetches the live postings and reports recall and a precision
-sample. In November 2026, recall on in-scope roles went from 6% to 63%. Most of
+sample. In November 2026, recall on in-scope roles went from 6% to 63%. "Eligible
+recall" also leaves out roles that say no sponsorship or need citizenship, since
+those are rejected on purpose. Most of
 the remaining misses are contract, annotation, and non-technical roles.
 
 ## Sources and discovery
@@ -66,7 +84,10 @@ boards it doesn't already have, using Simplify's company name. Companies on your
 excluded list are skipped. The new-grad list is also read every 15 minutes, with a
 conditional GET, as a backstop source for roles on systems the watcher can't read
 (iCIMS, custom career sites). A role found both directly and through Simplify is
-mailed once.
+mailed once. Simplify listings carry no description, so a Simplify copy of a job on a
+board the watcher already reads in full (baselined more than a day before the
+listing, and reading cleanly) is dropped; otherwise a posting the direct reader
+rejected for experience, sponsorship, or a clearance would be mailed anyway.
 
 ## Speed
 
