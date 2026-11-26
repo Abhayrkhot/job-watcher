@@ -1320,11 +1320,17 @@ def fetch_direct_board(board: dict) -> tuple[dict, list[dict]]:
         return board, []
 
 
+def quoted_slug(board: dict) -> str:
+    """The board name for a URL path. Decoded first, so a name harvested still
+    encoded ("Hippocratic%20AI") is not sent as "Hippocratic%2520AI" and 404."""
+    return urllib.parse.quote(urllib.parse.unquote(str(board["slug"])), safe="")
+
+
 def read_board(board: dict) -> list[dict]:
     provider = board["provider"]
     if provider in CAREER_SITE_FETCHERS:
         return CAREER_SITE_FETCHERS[provider](board, int(time.time()))
-    slug = urllib.parse.quote(board["slug"], safe="")
+    slug = quoted_slug(board)
     normalized = []
     if provider in {"lever", "lever-eu"}:
         domain = "api.eu.lever.co" if provider == "lever-eu" else "api.lever.co"
@@ -1945,7 +1951,9 @@ def board_from_url(url: str, company: str = "") -> dict | None:
     elif host in {"jobs.lever.co", "jobs.eu.lever.co"} and path:
         board = {"provider": "lever-eu" if ".eu." in host else "lever", "slug": path[0].lower()}
     elif host == "jobs.ashbyhq.com" and path:
-        board = {"provider": "ashby", "slug": path[0]}
+        # Ashby board names keep their case and spaces ("Hippocratic AI"); links
+        # carry them percent-encoded, and the readers encode the name themselves.
+        board = {"provider": "ashby", "slug": urllib.parse.unquote(path[0])}
     elif host in {"jobs.smartrecruiters.com", "careers.smartrecruiters.com"} and path:
         board = {"provider": "smartrecruiters", "slug": path[0]}
     elif host == "apply.workable.com" and path and path[0] != "j":
@@ -2572,7 +2580,7 @@ def find_migrated_board(board: dict, fetch=None) -> dict | None:
         return None
     old_key = f'{board["provider"]}:{board["slug"]}'
     family = "lever" if board["provider"].startswith("lever") else board["provider"]
-    slug = urllib.parse.quote(board["slug"], safe="")
+    slug = quoted_slug(board)
     for provider, template in MIGRATION_PROBE_URLS.items():
         if provider == family:
             continue

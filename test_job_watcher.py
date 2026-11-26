@@ -1618,6 +1618,27 @@ class DiscoveryTests(unittest.TestCase):
         found = job_watcher.harvest_boards(listings, {"ashby:known"}, now)
         self.assertEqual(found, [{"provider": "lever", "slug": "acme", "company": "Acme", "source": "simplify"}])
 
+    def test_ashby_names_are_decoded_once(self):
+        # Simplify links carry "Hippocratic%20AI"; the API wants "Hippocratic%20AI" in
+        # the path, not "Hippocratic%2520AI" (404).
+        board = job_watcher.board_from_url("https://jobs.ashbyhq.com/Hippocratic%20AI/abc-123")
+        self.assertEqual(board, {"provider": "ashby", "slug": "Hippocratic AI"})
+        now = int(time.time())
+        listings = [{"category": "Software", "date_posted": now, "company_name": "Hippocratic AI",
+                     "url": "https://jobs.ashbyhq.com/Hippocratic%20AI/abc-123"}]
+        self.assertEqual(job_watcher.harvest_boards(listings, {"ashby:hippocratic ai"}, now), [])
+
+        urls = []
+
+        def fetch(url, data=None, board=None):
+            urls.append(url)
+            return {"jobs": []}
+
+        with patch("job_watcher.fetch_json", side_effect=fetch):
+            for slug in ("Hippocratic%20AI", "Hippocratic AI"):  # old registry entry, new one
+                job_watcher.read_board({"provider": "ashby", "slug": slug})
+        self.assertEqual(urls, ["https://api.ashbyhq.com/posting-api/job-board/Hippocratic%20AI"] * 2)
+
     def test_harvest_skips_denied_and_already_moved_boards(self):
         now = int(time.time())
         listings = [
