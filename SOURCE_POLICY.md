@@ -30,7 +30,7 @@ read at the cadence of the watcher's normal polling.
 
 | Source | Endpoint | Constraints |
 | --- | --- | --- |
-| Workday | `POST https://<tenant>.wdN.myworkdayjobs.com/wday/cxs/<tenant>/<site>/jobs` and the matching job detail GET | 20 newest postings per page, at most 5 pages; details only for new IDs |
+| Workday | `POST https://<tenant>.wdN.myworkdayjobs.com/wday/cxs/<tenant>/<site>/jobs` and the matching job detail GET | 20 newest postings per page, at most 5 pages; details only for new IDs; per shared host, at most 3 requests at a time 0.35 s apart (1 at a time 5 s apart on wd3 and wd103), and nothing more to that host for the run after a 429 |
 | Oracle Recruiting Cloud | `GET /hcmRestApi/resources/latest/recruitingCEJobRequisitions` and `...JobRequisitionDetails` | 50 newest per poll; details only for new IDs |
 | BambooHR | `GET https://<company>.bamboohr.com/careers/list` and `/careers/<id>/detail` | Details only for new IDs |
 | Rippling | `GET https://api.rippling.com/platform/api/ats/v1/board/<slug>/jobs` | Details only for new IDs |

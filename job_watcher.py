@@ -21,7 +21,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
 from datetime import datetime, timezone
@@ -1558,26 +1558,48 @@ class DetailPlan:
         return jobs
 
 
-WORKDAY_WORKERS = 4  # Workday runs in its own pool, so pacing never blocks other boards
 WORKDAY_HOST_SPACING_SECONDS = 0.35
-WORKDAY_MAX_WAIT_SECONDS = 90  # per-run budget per host; later boards wait for the next run
+# Hosts that answer 429 after a few requests. On 2026-11-26, four workers starting
+# wd3 boards 0.35 s apart got about four boards a run before the first 429 (which
+# closes the host for the run), so a full pass over its 217 boards took about three
+# hours. Read one at a time at 5 s, wd3 answered 12 in a row once, 6 another time.
+WORKDAY_SLOW_HOST_SPACING_SECONDS = {
+    "wd3.myworkdayjobs.com": 5.0,
+    "wd103.myworkdayjobs.com": 5.0,
+}
+# Each host has its own lane that reads its boards oldest due first: one at a time on
+# a slow host, a few at a time elsewhere, so a slow host never holds up the others.
+# A lane starts no new board after this many seconds; the rest stay due for the
+# next run.
+WORKDAY_FAST_HOST_WORKERS = 3
+WORKDAY_HOST_BUDGET_SECONDS = 120
+WORKDAY_HOST_BUSY = "Workday host busy this run"
 _workday_lock = threading.Lock()
 _workday_next_slot: dict[str, float] = {}
 _workday_throttled: set[str] = set()
 
 
+def workday_host(url_or_slug: str) -> str:
+    """The shared Workday host: acme.wd3.myworkdayjobs.com -> wd3.myworkdayjobs.com."""
+    netloc = urllib.parse.urlsplit(url_or_slug).netloc or str(url_or_slug).split("/", 1)[0]
+    return netloc.split(".", 1)[-1]
+
+
+def workday_host_busy(url: str) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(url, 429, WORKDAY_HOST_BUSY, None, None)
+
+
 def workday_fetch(url: str, data: bytes | None = None) -> object:
     """Pace requests per Workday host (tenants share hosts; wd3 throttles hardest).
-    After a 429, or when the host is backed up, the board is deferred (transient)
-    and polled on a later run instead of waiting."""
-    host = urllib.parse.urlsplit(url).netloc.split(".", 1)[-1]
+    After a 429 the host is done for this run: its boards are deferred (transient)
+    and polled on the next run instead of retried."""
+    host = workday_host(url)
     with _workday_lock:
-        spacing = WORKDAY_HOST_SPACING_SECONDS
+        if host in _workday_throttled:
+            raise workday_host_busy(url)
+        spacing = WORKDAY_SLOW_HOST_SPACING_SECONDS.get(host, WORKDAY_HOST_SPACING_SECONDS)
         now = time.monotonic()
         start = max(now, _workday_next_slot.get(host, 0.0))
-        if host in _workday_throttled or start - now > WORKDAY_MAX_WAIT_SECONDS:
-            # This host is backed up for this run; try the board again on a later run.
-            raise urllib.error.HTTPError(url, 429, "Workday host busy this run", None, None)
         _workday_next_slot[host] = start + spacing
     if start > now:
         time.sleep(start - now)
@@ -2545,29 +2567,94 @@ def fetch_direct_batch(
         return [], []
     results = []
     failures = []
-    workday = [board for board in boards if board.get("provider") == "workday"]
+    lanes: dict[str, list[dict]] = {}
+    for board in boards:
+        if board.get("provider") == "workday":
+            lanes.setdefault(workday_host(str(board["slug"])), []).append(board)
     others = [board for board in boards if board.get("provider") != "workday"]
+    deadline = time.monotonic() + WORKDAY_HOST_BUDGET_SECONDS
+
+    def settle(board: dict, outcome: object) -> None:
+        if not isinstance(outcome, BaseException):
+            results.append(outcome)
+            return
+        failures.append((board, outcome))
+        if not is_workday_host_busy(outcome):  # deferrals are summarized per host below
+            print(
+                "ATS source failed "
+                f'provider={board.get("provider")} '
+                f'slug={board.get("slug")} '
+                f'url={board.get("url")} '
+                f"error={outcome}",
+                file=sys.stderr,
+            )
+
     with ThreadPoolExecutor(max_workers=8) as executor, \
-            ThreadPoolExecutor(max_workers=WORKDAY_WORKERS) as workday_executor:
+            ThreadPoolExecutor(max_workers=max(len(lanes), 1)) as lane_executor:
         futures = {executor.submit(fetch_direct_board, board): board for board in others}
         futures.update({
-            workday_executor.submit(fetch_direct_board, board): board for board in workday
+            lane_executor.submit(read_workday_lane, lane, deadline): host
+            for host, lane in lanes.items()
         })
         for future in as_completed(futures):
-            board = futures[future]
+            if isinstance(futures[future], str):  # a Workday host's lane
+                outcomes = future.result()
+                for board, outcome in outcomes:
+                    settle(board, outcome)
+                report_workday_lane(futures[future], outcomes)
+                continue
             try:
-                results.append(future.result())
+                outcome = future.result()
             except Exception as exc:
-                failures.append((board, exc))
-                print(
-                    "ATS source failed "
-                    f'provider={board.get("provider")} '
-                    f'slug={board.get("slug")} '
-                    f'url={board.get("url")} '
-                    f"error={exc}",
-                    file=sys.stderr,
-                )
+                outcome = exc
+            settle(futures[future], outcome)
     return results, failures
+
+
+def read_workday_lane(boards: list[dict], deadline: float) -> list[tuple[dict, object]]:
+    """Read one Workday host's boards in due order (oldest first): one at a time on a
+    slow host, WORKDAY_FAST_HOST_WORKERS at a time elsewhere. Once the host has
+    answered 429, or the lane's budget is spent, the remaining boards are deferred:
+    they keep their old check time, so they lead the next run's lane."""
+    queue = deque(boards)
+    outcomes: list[tuple[dict, object]] = []
+
+    def work() -> None:
+        while True:
+            try:
+                board = queue.popleft()
+            except IndexError:
+                return
+            with _workday_lock:
+                throttled = workday_host(str(board["slug"])) in _workday_throttled
+            if throttled or time.monotonic() >= deadline:
+                outcomes.append((board, workday_host_busy(str(board["slug"]))))
+                continue
+            try:
+                outcomes.append((board, fetch_direct_board(board)))
+            except Exception as exc:
+                outcomes.append((board, exc))
+
+    slow = bool(boards) and workday_host(str(boards[0]["slug"])) in WORKDAY_SLOW_HOST_SPACING_SECONDS
+    workers = 1 if slow else WORKDAY_FAST_HOST_WORKERS
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for future in [pool.submit(work) for _ in range(workers)]:
+            future.result()
+    return outcomes
+
+
+def is_workday_host_busy(exc: BaseException) -> bool:
+    return isinstance(exc, urllib.error.HTTPError) and exc.code == 429 and exc.msg == WORKDAY_HOST_BUSY
+
+
+def report_workday_lane(host: str, outcomes: list[tuple[dict, object]]) -> None:
+    deferred = sum(1 for _, outcome in outcomes
+                   if isinstance(outcome, BaseException) and is_workday_host_busy(outcome))
+    if deferred:
+        read = sum(1 for _, outcome in outcomes if not isinstance(outcome, BaseException))
+        with _workday_lock:
+            reason = "after a 429" if host in _workday_throttled else "budget spent"
+        print(f"Workday {host}: read {read} boards, deferred {deferred} to the next run ({reason})")
 
 
 def find_migrated_board(board: dict, fetch=None) -> dict | None:

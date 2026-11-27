@@ -1,3 +1,4 @@
+import io
 import sqlite3
 import socket
 import tempfile
@@ -1396,6 +1397,120 @@ class CareerSiteTests(unittest.TestCase):
         self.assertTrue(job_watcher.is_transient_http_error(caught.exception))
         # Only that board waits; other tenants on the host are still polled this run.
         self.assertNotIn("wd5.myworkdayjobs.com", job_watcher._workday_throttled)
+
+    def test_slow_workday_hosts_get_their_own_spacing(self):
+        job_watcher._workday_throttled.clear()
+        job_watcher._workday_next_slot.clear()
+        self.addCleanup(job_watcher._workday_next_slot.clear)
+        waits = []
+        with patch("job_watcher.fetch_json", return_value={}), \
+                patch("job_watcher.time.monotonic", return_value=1000.0), \
+                patch("job_watcher.time.sleep", side_effect=waits.append):
+            for tenant in ("a", "b"):
+                job_watcher.workday_fetch(f"https://{tenant}.wd3.myworkdayjobs.com/wday/cxs/{tenant}/C/jobs")
+                job_watcher.workday_fetch(f"https://{tenant}.wd5.myworkdayjobs.com/wday/cxs/{tenant}/C/jobs")
+        self.assertEqual([round(wait, 2) for wait in waits],
+                         [job_watcher.WORKDAY_SLOW_HOST_SPACING_SECONDS["wd3.myworkdayjobs.com"], 0.35])
+
+    def test_workday_lanes_read_a_slow_host_one_board_at_a_time_in_due_order(self):
+        import threading
+        lock = threading.Lock()
+        in_flight: dict[str, int] = {}
+        peak: dict[str, int] = {}
+        order: dict[str, list[str]] = {}
+
+        def fetch_board(board):
+            host = job_watcher.workday_host(board["slug"])
+            with lock:
+                in_flight[host] = in_flight.get(host, 0) + 1
+                peak[host] = max(peak.get(host, 0), in_flight[host])
+                order.setdefault(host, []).append(board["slug"].split(".")[0])
+            time.sleep(0.05)
+            with lock:
+                in_flight[host] -= 1
+            return board, []
+
+        job_watcher._workday_throttled.clear()
+        hosts = ["wd3", "wd5"] * 6
+        boards = [{"provider": "workday", "slug": f"t{n}.{host}.myworkdayjobs.com/t{n}/C"}
+                  for n, host in enumerate(hosts)]
+        with patch("job_watcher.fetch_direct_board", side_effect=fetch_board):
+            results, failures = job_watcher.fetch_direct_batch(boards)
+        self.assertEqual((len(results), failures), (12, []))
+        self.assertEqual(peak["wd3.myworkdayjobs.com"], 1)
+        self.assertEqual(peak["wd5.myworkdayjobs.com"], job_watcher.WORKDAY_FAST_HOST_WORKERS)
+        self.assertEqual(order["wd3.myworkdayjobs.com"], ["t0", "t2", "t4", "t6", "t8", "t10"])
+        self.assertEqual(len(order["wd5.myworkdayjobs.com"]), 6)
+
+    def test_workday_lane_stops_at_the_first_429_and_defers_the_rest(self):
+        job_watcher._workday_throttled.clear()
+        job_watcher._workday_next_slot.clear()
+        self.addCleanup(job_watcher._workday_throttled.clear)
+        requested = []
+
+        def fetch_json(url, data=None):
+            requested.append(url.split("//")[1].split(".")[0])
+            if "//b." in url:
+                raise http_error(429)
+            return {"total": 0, "jobPostings": []}
+
+        boards = [{"provider": "workday", "slug": f"{name}.wd3.myworkdayjobs.com/{name}/C", "_baseline": True}
+                  for name in "abcd"]
+        boards.append({"provider": "workday", "slug": "e.wd5.myworkdayjobs.com/e/C", "_baseline": True})
+        with patch("job_watcher.fetch_json", side_effect=fetch_json), \
+                patch("job_watcher.time.sleep"), \
+                patch("sys.stderr", new_callable=io.StringIO) as stderr, \
+                patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            results, failures = job_watcher.fetch_direct_batch(boards)
+        self.assertEqual(sorted(requested), ["a", "b", "e"])  # nothing more to wd3 after its 429
+        self.assertEqual(sorted(board["slug"][0] for board, _ in results), ["a", "e"])
+        self.assertEqual({board["slug"][0]: str(exc) for board, exc in failures}, {
+            "b": "HTTP Error 429: error",
+            "c": "HTTP Error 429: Workday host busy this run",
+            "d": "HTTP Error 429: Workday host busy this run",
+        })
+        self.assertTrue(all(job_watcher.is_transient_http_error(exc) for _, exc in failures))
+        # One line for the real 429, one summary for the deferred boards.
+        self.assertEqual(stderr.getvalue().count("ATS source failed"), 1)
+        self.assertNotIn("host busy", stderr.getvalue())
+        self.assertIn("Workday wd3.myworkdayjobs.com: read 1 boards, deferred 2 to the next run "
+                      "(after a 429)", stdout.getvalue())
+
+    def test_workday_lane_starts_no_board_after_its_budget(self):
+        job_watcher._workday_throttled.clear()
+        clock = [0.0]
+
+        def fetch_board(board):
+            clock[0] += 50  # each board takes 50 s of the 120 s budget
+            return board, []
+
+        boards = [{"provider": "workday", "slug": f"{name}.wd3.myworkdayjobs.com/{name}/C"} for name in "abcd"]
+        with patch("job_watcher.fetch_direct_board", side_effect=fetch_board), \
+                patch("job_watcher.time.monotonic", side_effect=lambda: clock[0]):
+            outcomes = job_watcher.read_workday_lane(boards, deadline=120.0)
+        self.assertEqual([isinstance(outcome, tuple) for _, outcome in outcomes], [True, True, True, False])
+        self.assertTrue(job_watcher.is_workday_host_busy(outcomes[3][1]))
+
+    def test_deferred_workday_boards_lead_the_next_run(self):
+        # wd3 on 2026-11-26: 217 boards, a few read per run, the rest deferred. With
+        # deferred boards keeping their old check time, every board is read in turn.
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE board_stats (board_key TEXT PRIMARY KEY, last_checked INTEGER, "
+            "relevant_count INTEGER, match_count INTEGER, failure_count INTEGER)"
+        )
+        boards = [{"provider": "workday", "slug": f"t{n}.wd3.myworkdayjobs.com/t{n}/C"} for n in range(40)]
+        now, last_read, longest_gap = 0, {}, 0
+        for _ in range(60):  # 60 runs, 4 minutes apart, 8 boards read per run
+            for board in select_due_boards(connection, boards, now)[:8]:
+                key = board["slug"]
+                longest_gap = max(longest_gap, now - last_read.get(key, 0))
+                last_read[key] = now
+                job_watcher.record_board_success(connection, board, 0, 0, now)
+            now += 240
+        self.assertEqual(len(last_read), 40)
+        self.assertLessEqual(longest_gap, 30 * 60)  # 40 boards / 8 per run * 4 min = 20 min a pass
 
     def test_first_poll_is_a_baseline_without_detail_calls(self):
         board = {"provider": "bamboohr", "slug": "acme", "_baseline": True}

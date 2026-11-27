@@ -123,6 +123,14 @@ board was not read, so it stays due and the next run tries it again; a new posti
 whose details were throttled keeps its board on the every-run schedule until it is
 read.
 
+Workday tenants share a few hosts (wd1, wd3, wd5 and so on), and each host has its
+own lane that reads its due boards oldest first. Most hosts get 3 requests at a time,
+0.35 s apart; hosts that throttle after a few requests (wd3, wd103) get one at a
+time, 5 s apart. After a 429 the watcher sends nothing more to that host until the
+next run, and a lane starts no new board after 120 seconds. Boards left over stay
+due, lead the next run's lane, and are summarized in one line per host in
+`watcher.log`.
+
 Network errors are not counted against a board. launchd starts a missed run as
 soon as the Mac wakes, often before DNS is back, so each run first waits up to 60
 seconds for DNS. If network errors still outnumber successful fetches, the run is
