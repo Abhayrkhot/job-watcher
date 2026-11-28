@@ -88,6 +88,16 @@ schema.org `JobPosting`), and Qualcomm (the Eightfold search API its careers sit
 calls). Microsoft's careers API answers 429 to an honest client, so it is not read.
 Their first poll is a silent baseline like any other board's.
 
+Jobright's hourly public GitHub lists (new-grad software and data roles) name many
+employers Simplify never lists. The watcher reads them once an hour, but never
+jobright.ai itself. For a US employer it doesn't poll, it looks for the employer's
+own board: links on the homepage Jobright names (or the first careers page it links
+to), then the employer's name on Greenhouse, Lever, and Ashby, accepted only when that
+board lists the same role, so a namesake isn't added. Up to 8 employers an hour are
+looked up, each once (or again after a week if nothing was found). The new board is
+polled from then on, and the posting that led to it is alerted from the employer's
+own board if it is recent and passes the filter.
+
 The registry grows on its own. Once a day the watcher reads SimplifyJobs' public
 New-Grad-Positions and Summer2027-Internships `listings.json`. It turns every
 Software or AI/ML/Data apply link from the past year into a board, and adds the

@@ -43,6 +43,21 @@ fetches per board per poll, and the first poll of a board records existing IDs
 without fetching any details. iCIMS, Taleo, and SuccessFactors boards are not
 polled, and Eightfold only for the company listed below.
 
+### Jobright lists (employer discovery)
+
+Enabled on 2026-11-28 by the owner's decision. Jobright's public GitHub lists name
+many employers that SimplifyJobs never lists. They are used only to learn which
+employers are hiring; their links point to jobright.ai, which is never read.
+
+| Source | Endpoint | Constraints |
+| --- | --- | --- |
+| Jobright lists | `README.md` from the public `jobright-ai/2026-Software-Engineer-New-Grad` and `jobright-ai/2026-Data-Analysis-New-Grad` GitHub repos | Conditional GET at most hourly; only rows from the last two days and US locations |
+| Employer lookup | For each employer the watcher doesn't poll: GET of the homepage Jobright names and of at most one careers page it links to, then the public Greenhouse, Lever, and Ashby list endpoints under up to three guesses of the employer's board name | At most 8 employers an hour, each looked up once (an employer not found is retried after a week); no login, cookies, or JavaScript; honest User-Agent; 10 s timeout and 3 MB cap per page; a name guess counts only if that board lists the same role |
+
+A board found this way is added to the registry and polled like any other. The
+posting that led to it is read once from that board (Greenhouse, Lever, and Ashby)
+and alerted if it is recent and passes the filter.
+
 ### Big-tech career sites
 
 Enabled on 2026-11-27 by the owner's decision. These companies run their own career

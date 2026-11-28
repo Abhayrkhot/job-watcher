@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -827,6 +827,10 @@ def connect_db() -> sqlite3.Connection:
         "source TEXT NOT NULL, job_id TEXT NOT NULL, "
         "first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
         "PRIMARY KEY(source, job_id))"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS discovered_companies ("
+        "company TEXT PRIMARY KEY, board_key TEXT NOT NULL DEFAULT '', tried_at INTEGER NOT NULL)"
     )
     return connection
 
@@ -2594,6 +2598,302 @@ def fetch_simplify(
     return results
 
 
+# --- Jobright discovery ---------------------------------------------------------------
+# Enabled on 2026-11-28 by the owner's decision (see SOURCE_POLICY.md). Jobright
+# publishes new-grad lists on GitHub every hour, covering many employers Simplify
+# never lists. Their links go to jobright.ai, which the watcher never reads: the lists
+# only say which employers are hiring. For an employer the watcher doesn't poll yet,
+# it looks for the employer's own job board, first among the links on the employer's
+# homepage (or the first careers page it links to), then under the employer's name on
+# the Greenhouse, Lever and Ashby APIs, where a board counts only if it lists the same
+# role (so a namesake is not added). The board joins the registry, and the posting
+# that led to it is alerted straight from that board, with the employer's own link
+# and description. Each employer is looked up once; one not found is retried weekly.
+JOBRIGHT_LISTS = {
+    "jobright-swe": "https://raw.githubusercontent.com/jobright-ai/2026-Software-Engineer-New-Grad/master/README.md",
+    "jobright-data": "https://raw.githubusercontent.com/jobright-ai/2026-Data-Analysis-New-Grad/master/README.md",
+}
+JOBRIGHT_INTERVAL_SECONDS = 60 * 60
+JOBRIGHT_MAX_AGE_DAYS = 2
+JOBRIGHT_RESOLVE_PER_RUN = 8
+JOBRIGHT_RESOLVE_WORKERS = 4
+JOBRIGHT_RETRY_SECONDS = 7 * 24 * 60 * 60
+JOBRIGHT_PROBE_PROVIDERS = ("greenhouse", "lever", "ashby")
+JOBRIGHT_ROW_RE = re.compile(
+    r"^\|\s*(?:\*\*(?:\[(?P<company>[^\]]*)\]\((?P<site>[^)]*)\)|(?P<plain>[^*|]+))\*\*|(?P<cont>↳))\s*\|"
+    r"\s*\*\*\[(?P<title>.*?)\]\([^)]*\)\*\*\s*\|(?P<location>[^|]*)\|[^|]*\|(?P<date>[^|]*)\|"
+)
+LEGAL_SUFFIX_RE = re.compile(r"(?:,?\s+(?:inc|llc|ltd|corp|corporation|co|company|plc|gmbh|lp)\.?)+$", re.I)
+LINK_RE = re.compile(r"""(?:href|src)\s*=\s*["']([^"'#\s]+)""", re.I)
+CAREERS_LINK_RE = re.compile(r"career|jobs|join-?us|work-with-us|hiring|open-roles|openings", re.I)
+# Hosts whose links name a job board. A link to greenhouse.io's own site is not one.
+JOB_BOARD_LINK_HOSTS_RE = re.compile(
+    r"^(?:(?:job-)?boards(?:\.eu)?\.greenhouse\.io|jobs(?:\.eu)?\.lever\.co|jobs\.ashbyhq\.com|"
+    r"(?:jobs|careers)\.smartrecruiters\.com|apply\.workable\.com|[a-z0-9-]+\.recruitee\.com|"
+    r".+\.myworkdayjobs\.com|.+\.myworkdaysite\.com|.+\.oraclecloud\.com|[a-z0-9-]+\.bamboohr\.com|"
+    r"[a-z0-9-]+\.applytojob\.com|jobs\.jobvite\.com|ats\.rippling\.com)$"
+)
+
+
+def jobright_day(text: str, today) -> object:
+    try:
+        day = datetime.strptime(f"{text.strip()} {today.year}", "%b %d %Y").date()
+    except ValueError:
+        return None
+    if day > today + timedelta(days=1):  # "Dec 31" read on January 1
+        day = day.replace(year=today.year - 1)
+    return day
+
+
+def jobright_rows(markdown: str, now: int) -> list[dict]:
+    """The rows of a Jobright list posted in the last two days. A row that starts
+    with "↳" is another role at the company of the row above."""
+    today = datetime.fromtimestamp(now, timezone.utc).date()
+    rows, company, site = [], "", ""
+    for line in markdown.splitlines():
+        match = JOBRIGHT_ROW_RE.match(line.strip())
+        if not match:
+            continue
+        if not match.group("cont"):
+            company = html.unescape((match.group("company") or match.group("plain") or "").strip())
+            site = (match.group("site") or "").strip()
+        day = jobright_day(match.group("date"), today)
+        if company and day is not None and (today - day).days <= JOBRIGHT_MAX_AGE_DAYS:
+            rows.append({
+                "company": company, "site": site,
+                "title": html.unescape(match.group("title").strip()),
+                "location": match.group("location").strip(),
+            })
+    return rows
+
+
+def company_key(name: object) -> str:
+    return normalize_company(LEGAL_SUFFIX_RE.sub("", str(name or "").strip()))
+
+
+def title_key(title: object) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(title or "").lower()))
+
+
+def titles_match(first: object, second: object) -> bool:
+    first, second = title_key(first), title_key(second)
+    if not first or not second:
+        return False
+    return first == second or (min(len(first), len(second)) >= 12 and (first in second or second in first))
+
+
+def page_links(url: str) -> list[str]:
+    """The page's final URL and every link or embed on it, made absolute."""
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "personal-new-grad-job-watcher/1.0",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Encoding": "gzip",
+    })
+    with urllib.request.urlopen(request, timeout=PAGE_READ_TIMEOUT_SECONDS) as response:
+        final = response.geturl()
+        body = response.read(PAGE_READ_MAX_BYTES)
+        if response.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        text = body.decode(response.headers.get_content_charset() or "utf-8", "replace")
+    return [final] + [urllib.parse.urljoin(final, html.unescape(link)) for link in LINK_RE.findall(text)]
+
+
+def boards_in_links(links: list[str]) -> list[dict]:
+    found = {}
+    for link in links:
+        host = urllib.parse.urlsplit(link).netloc.lower().split(":")[0]
+        if not JOB_BOARD_LINK_HOSTS_RE.match(host):
+            continue
+        board = board_from_url(link)
+        if board and board["provider"] in SUPPORTED_PROVIDERS:
+            found.setdefault(registry_key(board), board)
+    return list(found.values())
+
+
+def boards_on_site(site: str, company: str) -> list[dict]:
+    """Job boards that the employer's homepage, or the first careers page it links to,
+    point at, the one named most like the employer first."""
+    if not site.startswith(("http://", "https://")):
+        return []
+    try:
+        links = page_links(site)
+    except Exception:
+        return []
+    found = boards_in_links(links)
+    if not found:
+        careers = [link for link in links[1:] if CAREERS_LINK_RE.search(urllib.parse.urlsplit(link).path)
+                   or CAREERS_LINK_RE.search(urllib.parse.urlsplit(link).netloc.split(".")[0])]
+        for link in careers[:1]:
+            try:
+                found = boards_in_links(page_links(link))
+            except Exception:
+                found = []
+    key = company_key(company)
+
+    def unlikeness(board: dict) -> int:
+        name = company_key(board_company(board))
+        return 0 if name == key else 1 if name and (name in key or key in name) else 2
+
+    return sorted(found, key=unlikeness)
+
+
+def slug_guesses(company: str, site: str) -> list[str]:
+    words = re.findall(r"[a-z0-9]+", LEGAL_SUFFIX_RE.sub("", company.strip()).lower())
+    guesses = ["".join(words), "-".join(words)]
+    host = urllib.parse.urlsplit(site).netloc.lower().split(":")[0]
+    labels = [label for label in host.split(".")[:-1] if label not in ("www", "careers", "jobs")]
+    if labels:
+        guesses.append(labels[0])
+    return [guess for guess in dict.fromkeys(guesses) if len(guess) >= 2]
+
+
+def board_titles(board: dict) -> dict | None:
+    """Job ID to title for every posting on a Greenhouse, Lever or Ashby board, or None
+    when there is no such board."""
+    slug = quoted_slug(board)
+    try:
+        if board["provider"] == "greenhouse":
+            items = fetch_json(f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs").get("jobs") or []
+            return {str(item.get("id")): str(item.get("title") or "") for item in items}
+        if board["provider"] == "lever":
+            items = fetch_json(f"https://api.lever.co/v0/postings/{slug}?mode=json")
+            return {str(item.get("id")): str(item.get("text") or "")
+                    for item in items or [] if isinstance(item, dict)}
+        if board["provider"] == "ashby":
+            items = fetch_json(f"https://api.ashbyhq.com/posting-api/job-board/{slug}").get("jobs") or []
+            return {str(item.get("jobUrl") or item.get("id")): str(item.get("title") or "")
+                    for item in items if item.get("isListed", True)}
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 410):
+            return None
+        raise
+    return None
+
+
+def resolve_employer(company: str, site: str, titles: list[str], denied: set[str]) -> tuple:
+    """(board, its titles or None) for the employer's own job board, or (None, None)."""
+    for board in boards_on_site(site, company):
+        if registry_key(board) not in denied:
+            return board, None
+    for slug in slug_guesses(company, site):
+        for provider in JOBRIGHT_PROBE_PROVIDERS:
+            board = {"provider": provider, "slug": slug}
+            if registry_key(board) in denied:
+                continue
+            try:
+                listed = board_titles(board)
+            except Exception:
+                continue
+            if listed and any(titles_match(title, wanted) for title in listed.values() for wanted in titles):
+                return board, listed
+    return None, None
+
+
+def discovery_jobs(board: dict, listed: dict, titles: list[str], now: int) -> list[dict]:
+    """The board's own copies of the roles Jobright listed, read the way the board's
+    reader reads them (so only recent postings, with full descriptions)."""
+    matched = {job_id for job_id, title in listed.items() if any(titles_match(title, want) for want in titles)}
+    if not matched:
+        return []
+    if board["provider"] == "greenhouse":
+        jobs = fetch_greenhouse_board({**board, "_known_ids": frozenset(set(listed) - matched)}, now)
+    else:
+        jobs = read_board(board)
+    return [job for job in jobs if any(titles_match(job.get("title"), want) for want in titles)]
+
+
+def fetch_jobright(
+    connection: sqlite3.Connection, boards: list[dict], now: int, registry_path: Path
+) -> list[tuple[str, list[dict]]]:
+    last_checks = dict(connection.execute("SELECT source, last_checked FROM source_checks"))
+    rows = []
+    for name, url in JOBRIGHT_LISTS.items():
+        if now - int(last_checks.get(name, 0)) < JOBRIGHT_INTERVAL_SECONDS:
+            continue
+        try:
+            body = fetch_conditional(connection, url)
+            if body is not None:
+                rows += jobright_rows(body.decode("utf-8", "replace"), now)
+        except Exception as exc:
+            print(f"Jobright list failed ({name}): {exc}", file=sys.stderr)
+        finally:
+            connection.execute(
+                "INSERT INTO source_checks(source, last_checked) VALUES (?, ?) "
+                "ON CONFLICT(source) DO UPDATE SET last_checked=excluded.last_checked",
+                (name, now),
+            )
+    if not rows:
+        return []
+    known_companies = {company_key(board_company(board)) for board in boards}
+    known_boards = {registry_key(board) for board in boards}
+    known_boards |= {str(board["migrated_from"]).lower() for board in boards if board.get("migrated_from")}
+    tried = {company: (board_key, tried_at) for company, board_key, tried_at in connection.execute(
+        "SELECT company, board_key, tried_at FROM discovered_companies"
+    )}
+    denied = load_board_denylist()
+    wanted: dict[str, dict] = {}
+    for row in rows:
+        key = company_key(row["company"])
+        board_key, tried_at = tried.get(key, ("", None))
+        if (not key or key in known_companies or normalize_company(row["company"]) in EXCLUDED_COMPANIES
+                or "united states" not in row["location"].lower() or board_key
+                or (tried_at is not None and now - tried_at < JOBRIGHT_RETRY_SECONDS)):
+            continue
+        titles = wanted.setdefault(key, {"company": row["company"], "site": row["site"], "titles": []})["titles"]
+        if row["title"] not in titles:  # a role can be on both lists
+            titles.append(row["title"])
+    batch = list(wanted.items())[:JOBRIGHT_RESOLVE_PER_RUN]
+
+    def resolve(item):
+        key, entry = item
+        try:
+            return key, entry, resolve_employer(entry["company"], entry["site"], entry["titles"], denied)
+        except Exception as exc:
+            print(f"Jobright lookup failed ({entry['company']}): {exc}", file=sys.stderr)
+            return key, entry, (None, None)
+
+    with ThreadPoolExecutor(max_workers=JOBRIGHT_RESOLVE_WORKERS) as executor:
+        resolved = list(executor.map(resolve, batch))
+    new_boards, jobs = [], []
+    for key, entry, (board, listed) in resolved:
+        if (board and board["provider"] in JOBRIGHT_PROBE_PROVIDERS and listed is None
+                and registry_key(board) not in known_boards):
+            try:  # a board linked from the employer's site may be gone
+                listed = board_titles(board)
+            except Exception:
+                listed = None
+            if listed is None:
+                board = None
+        board_key = registry_key(board) if board else ""
+        connection.execute(
+            "INSERT INTO discovered_companies(company, board_key, tried_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(company) DO UPDATE SET board_key=excluded.board_key, tried_at=excluded.tried_at",
+            (key, board_key, now),
+        )
+        if not board or board_key in known_boards:
+            continue
+        known_boards.add(board_key)
+        board = {**board, "company": entry["company"], "source": "jobright"}
+        new_boards.append(board)
+        if board["provider"] in JOBRIGHT_PROBE_PROVIDERS:
+            try:
+                jobs += discovery_jobs(board, listed or {}, entry["titles"], now)
+            except Exception as exc:
+                print(f"Jobright posting read failed ({board_key}): {exc}", file=sys.stderr)
+    if new_boards:
+        source = registry_path if registry_path.exists() else BOOTSTRAP_BOARDS_PATH
+        current = json.loads(source.read_text()) if source.exists() else []
+        write_registry(current + new_boards, registry_path)
+        print(f"Jobright: looked up {len(resolved)} employers, added {len(new_boards)} boards: "
+              + ", ".join(registry_key(board) for board in new_boards))
+    elif resolved:
+        print(f"Jobright: looked up {len(resolved)} employers, added no boards")
+    # The postings found here are already limited to recent ones, so the source needs
+    # no silent first run.
+    connection.execute("INSERT OR IGNORE INTO initialized_boards(board_key) VALUES ('aggregator:jobright')")
+    return [("jobright", jobs)]
+
+
 def fetch_text(url: str) -> str:
     request = urllib.request.Request(
         url,
@@ -3855,6 +4155,7 @@ def main() -> int:
         else:
             aggregator_results = fetch_due_aggregators(connection, checked_at)
             aggregator_results += fetch_simplify(connection, boards, checked_at, BOARDS_PATH)
+            aggregator_results += fetch_jobright(connection, boards, checked_at, BOARDS_PATH)
             feed_results, failed_feeds = fetch_due_feeds(connection, feeds, checked_at)
         candidates = []
         initialized_count = 0

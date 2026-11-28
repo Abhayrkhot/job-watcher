@@ -1163,6 +1163,7 @@ class MainRunTests(unittest.TestCase):
             patch("job_watcher.send_push"),
             patch("job_watcher.send_health_report_if_due"),
             patch("job_watcher.fetch_simplify", return_value=[]),
+            patch("job_watcher.fetch_jobright", return_value=[]),
             patch("job_watcher.sys.argv", ["job_watcher.py"]),
         ]
         if fetch_json is not None:
@@ -1258,6 +1259,7 @@ class MainRunTests(unittest.TestCase):
                     patch("job_watcher.wait_for_network", return_value=True), \
                     patch("job_watcher.fetch_due_aggregators", return_value=[]), \
                     patch("job_watcher.fetch_simplify", return_value=[]), \
+                    patch("job_watcher.fetch_jobright", return_value=[]), \
                     patch("job_watcher.send_health_report_if_due"), \
                     patch("job_watcher.sys.argv", ["job_watcher.py"]), \
                     patch("job_watcher.send_push"), \
@@ -1759,6 +1761,125 @@ class BigTechReaderTests(unittest.TestCase):
         qualcomm = job_watcher.board_from_url("https://careers.qualcomm.com/careers/job/446")
         self.assertEqual(qualcomm["slug"], "careers.qualcomm.com/qualcomm.com")
         self.assertIsNot(amazon, job_watcher.BIG_TECH_HOSTS["www.amazon.jobs"])
+
+
+class JobrightDiscoveryTests(unittest.TestCase):
+    NOW = int(time.time())
+
+    def day(self, days_ago=0, now=None):
+        return time.strftime("%b %d", time.gmtime((now or self.NOW) - days_ago * 86400)).replace(" 0", " ")
+
+    def markdown(self, now=None):
+        day = lambda days_ago=0: self.day(days_ago, now)  # noqa: E731
+        return "\n".join([
+            "| Company | Job Title | Location | Work Model | Date Posted |",
+            "| ----- | --------- |  --------- | ---- | ------- |",
+            f"| **[Acme Robotics, Inc.](https://acme.example)** | **[Software Engineer, New Grad](https://jobright.ai/jobs/info/1)** | Boston, MA, United States | On Site | {day()} |",
+            f"| ↳ | **[Data Engineer [Remote]](https://jobright.ai/jobs/info/2)** | Remote, United States | Remote | {day(1)} |",
+            f"| **Plainco** | **[Junior Developer](https://jobright.ai/jobs/info/3)** | Toronto, ON, Canada | On Site | {day()} |",
+            f"| **[Oldco](https://old.example)** | **[Software Engineer](https://jobright.ai/jobs/info/4)** | Austin, TX, United States | On Site | {day(9)} |",
+        ])
+
+    def connection(self):
+        directory = Path(tempfile.mkdtemp())
+        with patch("job_watcher.DB_PATH", directory / "jobs.sqlite3"), \
+                patch("job_watcher.STATE_DIR", directory):
+            connection = job_watcher.connect_db()
+        self.addCleanup(connection.close)
+        return connection, directory
+
+    def test_rows_carry_the_company_down_and_skip_old_ones(self):
+        rows = job_watcher.jobright_rows(self.markdown(), self.NOW)
+        self.assertEqual([(row["company"], row["title"]) for row in rows], [
+            ("Acme Robotics, Inc.", "Software Engineer, New Grad"),
+            ("Acme Robotics, Inc.", "Data Engineer [Remote]"),
+            ("Plainco", "Junior Developer"),
+        ])
+        self.assertEqual(rows[0]["site"], "https://acme.example")
+        self.assertEqual(rows[2]["site"], "")
+
+    def test_titles_match_loosely_but_not_on_short_words(self):
+        self.assertTrue(job_watcher.titles_match("Graduate software engineer, US", "Graduate Software Engineer - US"))
+        self.assertTrue(job_watcher.titles_match("Software Engineer, New Grad (2026)", "Software Engineer, New Grad"))
+        self.assertFalse(job_watcher.titles_match("Engineer", "Software Engineer"))
+        self.assertEqual(job_watcher.company_key("Acme Robotics, Inc."), "acmerobotics")
+
+    def test_board_linked_from_the_employers_site_wins(self):
+        pages = {
+            "https://acme.example": ["https://acme.example/", "https://www.greenhouse.io/blog", "https://acme.example/careers"],
+            "https://acme.example/careers": ["https://acme.example/careers",
+                                             "https://job-boards.greenhouse.io/acmerobotics/jobs/42"],
+        }
+        with patch("job_watcher.page_links", side_effect=lambda url: pages[url]):
+            board, listed = job_watcher.resolve_employer("Acme Robotics", "https://acme.example", ["x"], set())
+        self.assertEqual((board["provider"], board["slug"], listed), ("greenhouse", "acmerobotics", None))
+
+    def test_a_board_found_by_name_must_list_the_same_role(self):
+        def fetch(url, data=None):
+            if "boards-api.greenhouse.io/v1/boards/acmerobotics/" in url:
+                return {"jobs": [{"id": 7, "title": "Account Executive"}]}  # a namesake
+            if "api.ashbyhq.com/posting-api/job-board/acme-robotics" in url:
+                return {"jobs": [{"jobUrl": "https://jobs.ashbyhq.com/acme-robotics/9",
+                                  "title": "Software Engineer - New Grad"}]}
+            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+
+        with patch("job_watcher.boards_on_site", return_value=[]), \
+                patch("job_watcher.fetch_json", side_effect=fetch):
+            board, listed = job_watcher.resolve_employer(
+                "Acme Robotics", "", ["Software Engineer, New Grad"], set())
+            self.assertEqual((board["provider"], board["slug"]), ("ashby", "acme-robotics"))
+            self.assertEqual(list(listed.values()), ["Software Engineer - New Grad"])
+            self.assertEqual(job_watcher.resolve_employer("Acme Robotics", "", ["Data Scientist"], set()),
+                             (None, None))
+
+    def test_new_employer_board_is_added_and_its_posting_alerted(self):
+        connection, directory = self.connection()
+        registry = directory / "ats_boards.json"
+        registry.write_text(json.dumps([{"provider": "lever", "slug": "plainco", "company": "Plainco"}]))
+        posting = job_watcher.direct_job(
+            {"provider": "lever", "slug": "acme", "company": "Acme Robotics, Inc."}, "p1",
+            "Software Engineer, New Grad", ["Boston, MA", "United States"], "https://jobs.lever.co/acme/p1",
+            "Bachelor's degree. 0-1 years of experience.", self.NOW - 1800)
+        lookups = []
+
+        def resolve(company, site, titles, denied):
+            lookups.append((company, titles))
+            return {"provider": "lever", "slug": "acme"}, {"p1": "Software Engineer, New Grad"}
+
+        with patch("job_watcher.fetch_conditional", return_value=self.markdown().encode()) as fetch, \
+                patch("job_watcher.resolve_employer", side_effect=resolve), \
+                patch("job_watcher.read_board", return_value=[posting]), \
+                patch("job_watcher.BOARD_DENYLIST_PATH", directory / "none.json"):
+            boards = json.loads(registry.read_text())
+            results = job_watcher.fetch_jobright(connection, boards, self.NOW, registry)
+            again = job_watcher.fetch_jobright(connection, boards, self.NOW + 60, registry)
+        # Plainco is already polled (and Canadian); Oldco's row is too old.
+        self.assertEqual(lookups, [("Acme Robotics, Inc.", ["Software Engineer, New Grad", "Data Engineer [Remote]"])])
+        self.assertEqual(results, [("jobright", [posting])])
+        self.assertEqual(again, [])
+        self.assertEqual(fetch.call_count, len(job_watcher.JOBRIGHT_LISTS))  # once an hour
+        added = json.loads(registry.read_text())[-1]
+        self.assertEqual(added, {"provider": "lever", "slug": "acme", "company": "Acme Robotics, Inc.",
+                                 "source": "jobright"})
+        self.assertEqual(connection.execute("SELECT board_key FROM discovered_companies").fetchall(),
+                         [("lever:acme",)])
+        candidates, initialized = source_candidates(connection, "aggregator:jobright", [posting])
+        self.assertEqual((len(candidates), initialized), (1, False))  # no silent first run
+
+    def test_employer_not_found_is_retried_after_a_week(self):
+        connection, directory = self.connection()
+        registry = directory / "ats_boards.json"
+        registry.write_text("[]")
+        calls = []
+        times = [self.NOW, self.NOW + 2 * 3600, self.NOW + 8 * 86400]
+        lists = [self.markdown(now).encode() for now in times for _ in job_watcher.JOBRIGHT_LISTS]
+        with patch("job_watcher.fetch_conditional", side_effect=lists), \
+                patch("job_watcher.resolve_employer", side_effect=lambda *args: calls.append(args[0]) or (None, None)), \
+                patch("job_watcher.BOARD_DENYLIST_PATH", directory / "none.json"):
+            for now in times:
+                job_watcher.fetch_jobright(connection, [], now, registry)
+        self.assertEqual(calls, ["Acme Robotics, Inc.", "Acme Robotics, Inc."])
+        self.assertEqual(json.loads(registry.read_text()), [])
 
 
 class ConditionalFetchTests(unittest.TestCase):
