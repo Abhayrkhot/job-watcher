@@ -1763,6 +1763,111 @@ class BigTechReaderTests(unittest.TestCase):
         self.assertIsNot(amazon, job_watcher.BIG_TECH_HOSTS["www.amazon.jobs"])
 
 
+class IcimsUkgReaderTests(unittest.TestCase):
+    NOW = int(time.time())
+
+    @staticmethod
+    def icims_card(job_id, title):
+        return (f'<li class="iCIMS_JobCardItem"><a href="https://careers-acme.icims.com/jobs/{job_id}/'
+                f'{title.lower().replace(" ", "-")}/job?in_iframe=1" class="iCIMS_Anchor" '
+                f'title="{job_id} - {title}"><h3>{title}</h3></a></li>')
+
+    def icims_job_page(self, title, days_ago=0):
+        posted = datetime.fromtimestamp(self.NOW - days_ago * 86400 - 600, timezone.utc).isoformat()
+        return ('<script type="application/ld+json">' + json.dumps({
+            "@context": "http://schema.org", "@type": "JobPosting", "title": title,
+            "description": "&lt;p&gt;Bachelor&#39;s degree. New graduates welcome.&lt;/p&gt;", "datePosted": posted,
+            "jobLocation": [{"@type": "Place", "address": {"addressLocality": "Austin", "addressRegion": "TX",
+                                                           "addressCountry": "US"}}],
+        }) + "</script>")
+
+    def test_icims_listing_reads_ids_and_titles(self):
+        page = self.icims_card(12807, "Software Engineer I") + self.icims_card(12806, "Plumber") + \
+            '<a href="https://careers-acme.icims.com/jobs/12805/data-analyst/job?in_iframe=1">x</a>'
+        self.assertEqual(job_watcher.icims_listing(page),
+                         [("12807", "Software Engineer I"), ("12806", "Plumber"), ("12805", "x")])
+
+    def test_icims_reads_job_pages_only_for_new_tech_ids(self):
+        search = self.icims_card(12807, "Software Engineer I") + self.icims_card(12806, "Plumber") + \
+            self.icims_card(12700, "Software Engineer")
+        urls = []
+
+        def fetch(url):
+            urls.append(url)
+            return search if "/jobs/search" in url else self.icims_job_page("Software Engineer I")
+
+        board = {"provider": "icims", "slug": "careers-acme.icims.com", "company": "Acme",
+                 "_known_ids": frozenset({"12700"})}
+        with patch("job_watcher.fetch_html", side_effect=fetch):
+            jobs = job_watcher.fetch_icims_board(board, self.NOW)
+        # One search page (a known ID is on it), then one job page: the plumber is screened out.
+        self.assertEqual(urls, ["https://careers-acme.icims.com/jobs/search?ss=1&in_iframe=1&pr=0",
+                                "https://careers-acme.icims.com/jobs/12807/job?in_iframe=1"])
+        self.assertEqual(jobs[0]["url"], "https://careers-acme.icims.com/jobs/12807/job")
+        self.assertEqual(jobs[0]["locations"], ["Austin, TX, United States"])
+        self.assertIn("New graduates welcome", jobs[0]["description"])
+        self.assertTrue(matches(jobs[0]))
+
+    def test_icims_reads_a_second_page_only_when_the_first_is_all_new(self):
+        pages = {0: self.icims_card(30, "Plumber") + self.icims_card(29, "Welder"), 1: self.icims_card(28, "Driver")}
+        urls = []
+
+        def fetch(url):
+            urls.append(url)
+            return pages[int(url.rsplit("pr=", 1)[1])]
+
+        with patch("job_watcher.fetch_html", side_effect=fetch):
+            job_watcher.fetch_icims_board({"provider": "icims", "slug": "careers-acme.icims.com"}, self.NOW)
+        self.assertEqual(len(urls), 2)
+        urls.clear()
+        with patch("job_watcher.fetch_html", side_effect=fetch):
+            job_watcher.fetch_icims_board({"provider": "icims", "slug": "careers-acme.icims.com", "_baseline": True},
+                                          self.NOW)
+        self.assertEqual(len(urls), 1)
+
+    def test_ukg_lists_newest_first_and_reads_the_embedded_details(self):
+        posted = datetime.fromtimestamp(self.NOW - 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.1234567Z")
+        location = {"Address": {"City": "Brookfield", "State": {"Code": "WI"},
+                                "Country": {"Code": "USA", "Name": "United States"}}}
+        detail = {"Id": "abc", "Title": "Software Engineer (Remote)", "PostedDate": posted,
+                  "Description": "<p>Entry level. Bachelor's degree.</p>", "Locations": [location],
+                  "JobLocationType": 2}
+        page = ("<script>var opportunity = new US.Opportunity.CandidateOpportunityDetail("
+                + json.dumps(detail) + ");</script>")
+        bodies = []
+
+        def fetch_json(url, data=None, board=None):
+            bodies.append(json.loads(data))
+            self.assertTrue(url.endswith("/acme1/JobBoard/0f0f-guid/JobBoardView/LoadSearchResults"))
+            return {"opportunities": [
+                {"Id": "abc", "Title": "Software Engineer (Remote)", "PostedDate": posted, "Locations": [location]},
+                {"Id": "old", "Title": "Software Engineer", "PostedDate": "2020-01-01T00:00:00Z"},
+            ], "totalCount": 2}
+
+        board = {"provider": "ukg", "slug": "recruiting.ultipro.com/acme1/0f0f-guid", "company": "Acme"}
+        with patch("job_watcher.fetch_json", side_effect=fetch_json), \
+                patch("job_watcher.fetch_html", return_value=page) as fetch_html:
+            jobs = job_watcher.fetch_ukg_board(board, self.NOW)
+        self.assertEqual(bodies[0]["opportunitySearch"]["OrderBy"][0]["Value"], "postedDateDesc")
+        fetch_html.assert_called_once_with(
+            "https://recruiting.ultipro.com/acme1/JobBoard/0f0f-guid/OpportunityDetail?opportunityId=abc")
+        self.assertEqual(jobs[0]["locations"], ["Brookfield, WI, United States", "Remote"])
+        self.assertEqual(jobs[0]["posted_precision"], "time")
+        self.assertTrue(matches(jobs[0]))
+
+    def test_icims_and_ukg_links_map_to_boards(self):
+        icims = job_watcher.board_from_url("https://careers-enfra.icims.com/jobs/9651/job?mobile=true", "ENFRA")
+        self.assertEqual((icims["provider"], icims["slug"]), ("icims", "careers-enfra.icims.com"))
+        self.assertIsNone(job_watcher.board_from_url("https://www.icims.com/products/"))
+        ukg = job_watcher.board_from_url(
+            "https://recruiting.ultipro.com/uni1105uscs/JobBoard/F098A23A-c6d0/OpportunityDetail?opportunityId=1")
+        self.assertEqual((ukg["provider"], ukg["slug"]), ("ukg", "recruiting.ultipro.com/uni1105uscs/f098a23a-c6d0"))
+        pro = job_watcher.board_from_url(
+            "https://medmutual.rec.pro.ukg.net/MED1500MMOO/JobBoard/ef82/OpportunityDetail?opportunityId=5")
+        self.assertEqual(pro["slug"], "medmutual.rec.pro.ukg.net/MED1500MMOO/ef82")
+        self.assertEqual(job_watcher.board_interval_seconds(0, 0, "icims"), 20 * 60)
+
+
 class JobrightDiscoveryTests(unittest.TestCase):
     NOW = int(time.time())
 

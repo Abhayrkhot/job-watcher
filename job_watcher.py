@@ -39,7 +39,9 @@ ATS_BATCH_SIZE = 2000
 HOT_POLL_SECONDS = 2 * 60
 BASE_POLL_SECONDS = 10 * 60
 # Workday hosts throttle (1500+ tenants share a few hosts), so quiet tenants wait longer.
-PROVIDER_BASE_POLL_SECONDS = {"workday": 20 * 60}
+# iCIMS has no cheap list (each poll reads a 100 KB search page), so like Workday its
+# quiet boards are read every 20 minutes rather than 10.
+PROVIDER_BASE_POLL_SECONDS = {"workday": 20 * 60, "icims": 20 * 60}
 # launchd starts a missed run the moment the Mac wakes, often before DNS is back.
 NETWORK_WAIT_SECONDS = 60
 NETWORK_RETRY_SECONDS = 5
@@ -65,7 +67,7 @@ FILTER_NO_SPONSORSHIP = os.environ.get("JOB_WATCHER_KEEP_NO_SPONSORSHIP") != "1"
 SUPPORTED_PROVIDERS = {
     "ashby", "greenhouse", "lever", "lever-eu", "recruitee", "smartrecruiters",
     "workable", "workday", "oracle", "bamboohr", "rippling", "jobvite", "jazzhr",
-    "amazon", "google", "apple", "meta", "eightfold",
+    "amazon", "google", "apple", "meta", "eightfold", "icims", "ukg",
 }
 # --- Role filter --------------------------------------------------------------
 # Recall first: accept anything in the software / data / ML area and reject only
@@ -1474,7 +1476,7 @@ def read_board(board: dict) -> list[dict]:
 
 DETAIL_PROVIDERS = {
     "greenhouse", "smartrecruiters", "workday", "oracle", "bamboohr", "rippling", "jobvite",
-    "amazon", "google", "apple", "meta", "eightfold",
+    "amazon", "google", "apple", "meta", "eightfold", "icims", "ukg",
 }
 MAX_DETAIL_FETCHES_PER_BOARD = 25
 WORKDAY_PAGE_SIZE = 20
@@ -2144,7 +2146,153 @@ def fetch_eightfold_board(board: dict, now: int) -> list[dict]:
     return plan.details(one)
 
 
+# --- iCIMS and UKG -------------------------------------------------------------------
+# Enabled on 2026-11-28 by the owner's decision (see SOURCE_POLICY.md). About a third
+# of Simplify's new-grad roles sit on systems with no reader, iCIMS and UKG among the
+# largest. iCIMS has no public JSON, so its careers portal's search page is read for
+# job IDs and titles, and the job page (which embeds a schema.org JobPosting for search
+# engines) for each new ID whose title passes. A UKG (UltiPro) job board loads its
+# list from a JSON endpoint, newest first, and embeds each job's details in its page.
+# Avature was looked at too, but its lists are alphabetical with a few jobs a page and
+# its feed shows the oldest jobs, so seeing a new job would mean paging through all of
+# them on every poll; it is left to the Simplify backstop.
+ICIMS_MAX_PAGES = 2
+ICIMS_ANCHOR_RE = re.compile(r"<a\b[^>]*\bhref=\"(https?://[^\"]+/jobs/(\d+)/[^\"]*)\"[^>]*>(.*?)</a>", re.S | re.I)
+ICIMS_TITLE_ATTR_RE = re.compile(r"\btitle=\"\d+ - ([^\"]+)\"")
+UKG_PAGE_SIZE = 50
+UKG_MAX_PAGES = 3
+UKG_DETAIL_RE = re.compile(r"CandidateOpportunityDetail\(")
+
+
+def icims_listing(page_html: str) -> list[tuple[str, str]]:
+    """(job ID, title) for each job card on an iCIMS search page, in page order."""
+    found: dict[str, str] = {}
+    for match in ICIMS_ANCHOR_RE.finditer(page_html):
+        href, job_id, inner = match.groups()
+        attr = ICIMS_TITLE_ATTR_RE.search(match.group(0))
+        title = html.unescape(attr.group(1)) if attr else plain_text(inner)
+        if not title:
+            slug = href.split(f"/jobs/{job_id}/", 1)[1].split("/", 1)[0]
+            title = "" if slug == "job" else slug.replace("-", " ")
+        if title and job_id not in found:
+            found[job_id] = title.strip()
+    return list(found.items())
+
+
+def ld_job_posting(page_html: str) -> dict:
+    for block in LD_JSON_RE.findall(page_html):
+        try:
+            posting = next(job_postings(json.loads(block)), None)
+        except ValueError:
+            continue
+        if posting:
+            return posting
+    return {}
+
+
+def posting_locations(posting: dict) -> list[str]:
+    places = posting.get("jobLocation") or []
+    places = places if isinstance(places, list) else [places]
+    locations = []
+    for place in places:
+        address = (place.get("address") or {}) if isinstance(place, dict) else {}
+        if isinstance(address, dict):
+            country = str(address.get("addressCountry") or "")
+            if isinstance(address.get("addressCountry"), dict):
+                country = str(address["addressCountry"].get("name") or "")
+            locations.append(", ".join(filter(None, (
+                str(address.get("addressLocality") or ""), str(address.get("addressRegion") or ""),
+                "United States" if country.upper() in ("US", "USA") else country,
+            ))))
+    return [location for location in locations if location]
+
+
+def fetch_icims_board(board: dict, now: int) -> list[dict]:
+    host = str(board["slug"])
+    plan = DetailPlan(board)
+    for page in range(ICIMS_MAX_PAGES):
+        listing = icims_listing(fetch_html(f"https://{host}/jobs/search?ss=1&in_iframe=1&pr={page}"))
+        for job_id, title in listing:
+            plan.consider(job_id, title, True, title)
+        # A second page only when every job on the first one is new (a burst of postings).
+        if plan.baseline or not listing or any(job_id in plan.known for job_id, _ in listing):
+            break
+
+    def one(job_id, title):
+        url = f"https://{host}/jobs/{job_id}/job"
+        page_html = fetch_html(f"{url}?in_iframe=1")
+        posting = ld_job_posting(page_html)
+        description = plain_text(html.unescape(str(posting.get("description") or ""))) if posting else \
+            posting_page_text(page_html)
+        return with_posting(direct_job(
+            board, job_id, html.unescape(str(posting.get("title") or title)),
+            posting_locations(posting), url, description, None,
+        ), posting.get("datePosted"), now)
+
+    return plan.details(one)
+
+
+def ukg_locations(entries: object, remote: bool) -> list[str]:
+    locations = []
+    for entry in entries or []:
+        address = (entry or {}).get("Address") or {}
+        country = (address.get("Country") or {}).get("Name") or (address.get("Country") or {}).get("Code") or ""
+        locations.append(", ".join(filter(None, (
+            address.get("City"), (address.get("State") or {}).get("Code"),
+            "United States" if str(country).upper() in ("USA", "US", "UNITED STATES") else country,
+        ))) or str((entry or {}).get("LocalizedDescription") or ""))
+    if remote:
+        locations.append("Remote")
+    return [str(location) for location in locations if location]
+
+
+def fetch_ukg_board(board: dict, now: int) -> list[dict]:
+    """A UKG (UltiPro) job board. The slug is "<host>/<tenant>/<job board ID>"."""
+    host, tenant, board_id = str(board["slug"]).split("/", 2)
+    base = f"https://{host}/{tenant}/JobBoard/{board_id}"
+    plan = DetailPlan(board)
+    for page in range(UKG_MAX_PAGES):
+        payload = fetch_json(f"{base}/JobBoardView/LoadSearchResults", json.dumps({
+            "opportunitySearch": {
+                "Top": UKG_PAGE_SIZE, "Skip": page * UKG_PAGE_SIZE, "QueryString": "",
+                "OrderBy": [{"Value": "postedDateDesc", "PropertyName": "PostedDate", "Ascending": False}],
+                "Filters": [{"t": "TermsSearchFilterDto", "fieldName": field, "extra": None, "values": []}
+                            for field in (4, 5, 6)],
+            },
+            "matchCriteria": {"PreferredJobs": [], "Educations": [], "LicenseAndCertifications": [],
+                              "Skills": [], "hasNoLicenses": False, "SkippedSkills": []},
+        }).encode())
+        items = payload.get("opportunities") or []
+        stamps = []
+        for item in items:
+            stamp = parse_job_datetime(FRACTIONAL_SECONDS_RE.sub(r"\1", str(item.get("PostedDate") or "")))
+            stamps.append(stamp)
+            plan.consider(item.get("Id"), item.get("Title"), is_fresh(stamp, now), item)
+        if plan.baseline or len(items) < UKG_PAGE_SIZE or not any(is_fresh(stamp, now) for stamp in stamps):
+            break
+
+    def one(job_id, item):
+        url = f"{base}/OpportunityDetail?opportunityId={urllib.parse.quote(job_id)}"
+        page_html = fetch_html(url)
+        match = UKG_DETAIL_RE.search(page_html)
+        detail = {}
+        if match:
+            detail, _ = json.JSONDecoder().raw_decode(page_html, page_html.index("{", match.end() - 1))
+        posted = FRACTIONAL_SECONDS_RE.sub(r"\1", str(detail.get("PostedDate") or item.get("PostedDate") or ""))
+        remote = str(detail.get("JobLocationType") or item.get("JobLocationType")) == "2"
+        return with_posting(direct_job(
+            board, job_id, str(detail.get("Title") or item.get("Title") or ""),
+            ukg_locations(detail.get("Locations") or item.get("Locations"), remote), url,
+            plain_text(str(detail.get("Description") or item.get("BriefDescription") or "")),
+            None,
+        ), posted or None, now)
+
+    return plan.details(one)
+
+
 CAREER_SITE_FETCHERS = {
+    "icims": fetch_icims_board,
+    "ukg": fetch_ukg_board,
     "amazon": fetch_amazon_board,
     "google": fetch_google_board,
     "apple": fetch_apple_board,
@@ -2211,7 +2359,7 @@ def remember_listed_ids(connection: sqlite3.Connection, board: dict) -> None:
 # link names a company's ATS board, so the lists double as a directory of companies
 # that hire new grads. New boards are added to state/ats_boards.json once a day, and
 # fresh new-grad listings are also used as a backstop source for roles on ATSes the
-# watcher can't read (iCIMS, custom career sites).
+# watcher can't read (SuccessFactors, Avature, custom career sites).
 
 SIMPLIFY_LISTINGS = {
     "simplify-newgrad": "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
@@ -2285,6 +2433,11 @@ def board_from_url(url: str, company: str = "") -> dict | None:
         board = segments and {"provider": "rippling", "slug": segments[0]}
     elif host.endswith(".recruitee.com"):
         board = {"provider": "recruitee", "slug": host.split(".")[0]}
+    elif host.endswith(".icims.com") and host.count(".") == 2 and path[:1] == ["jobs"]:
+        board = {"provider": "icims", "slug": host}
+    elif (host in {"recruiting.ultipro.com", "recruiting2.ultipro.com"} or host.endswith(".rec.pro.ukg.net")) \
+            and len(path) >= 3 and path[1].lower() == "jobboard":
+        board = {"provider": "ukg", "slug": f"{host}/{path[0]}/{path[2].lower()}"}
     elif host in BIG_TECH_HOSTS and (host != "www.google.com" or path[:2] == ["about", "careers"]):
         board = dict(BIG_TECH_HOSTS[host])
     if not board:
@@ -2631,7 +2784,8 @@ JOB_BOARD_LINK_HOSTS_RE = re.compile(
     r"^(?:(?:job-)?boards(?:\.eu)?\.greenhouse\.io|jobs(?:\.eu)?\.lever\.co|jobs\.ashbyhq\.com|"
     r"(?:jobs|careers)\.smartrecruiters\.com|apply\.workable\.com|[a-z0-9-]+\.recruitee\.com|"
     r".+\.myworkdayjobs\.com|.+\.myworkdaysite\.com|.+\.oraclecloud\.com|[a-z0-9-]+\.bamboohr\.com|"
-    r"[a-z0-9-]+\.applytojob\.com|jobs\.jobvite\.com|ats\.rippling\.com)$"
+    r"[a-z0-9-]+\.applytojob\.com|jobs\.jobvite\.com|ats\.rippling\.com|[a-z0-9-]+\.icims\.com|"
+    r"recruiting2?\.ultipro\.com|[a-z0-9-]+\.rec\.pro\.ukg\.net)$"
 )
 
 

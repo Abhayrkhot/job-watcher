@@ -40,8 +40,23 @@ read at the cadence of the watcher's normal polling.
 
 All readers share the global limits: 8 concurrent requests, at most 25 detail
 fetches per board per poll, and the first poll of a board records existing IDs
-without fetching any details. iCIMS, Taleo, and SuccessFactors boards are not
+without fetching any details. Taleo, SuccessFactors, and Avature boards are not
 polled, and Eightfold only for the company listed below.
+
+### iCIMS and UKG
+
+Enabled on 2026-11-28 by the owner's decision. Boards on these systems are found the
+same way as the others (Simplify harvest, Jobright discovery) and read at the normal
+polling cadence, with no login or cookies and an honest User-Agent.
+
+| Source | Endpoint | Constraints |
+| --- | --- | --- |
+| iCIMS | `GET https://<portal>.icims.com/jobs/search?ss=1&in_iframe=1` (the careers portal's search page), then `GET /jobs/<id>/job?in_iframe=1` for new IDs, reading its schema.org `JobPosting` | One search page per poll (a second only when every job on the first is new); quiet boards every 20 minutes; job pages only for new IDs whose title passes the filter |
+| UKG (UltiPro) | `POST https://<host>/<tenant>/JobBoard/<board>/JobBoardView/LoadSearchResults` (the JSON the job board page loads, newest first), then `GET .../OpportunityDetail?opportunityId=<id>` for new IDs | 50 per page, at most 3 pages while they hold postings from the last two days; details only for new IDs |
+
+Avature was reviewed the same day and is not polled: its career sites list jobs
+alphabetically a few at a time and their feeds show the oldest jobs, so finding a new
+posting would mean paging through every job on every poll.
 
 ### Jobright lists (employer discovery)
 
@@ -80,7 +95,7 @@ networks, so it is not read.
 ## Posting pages for Simplify backstop jobs
 
 Enabled on 2026-11-25 by the owner's decision. A SimplifyJobs listing has no job
-description, so postings on systems the watcher does not poll (iCIMS, SuccessFactors,
+description, so postings on systems the watcher does not poll (SuccessFactors, Avature,
 custom career sites) were mailed without the experience, clearance, or sponsorship
 checks. For those jobs the watcher now reads the posting page itself.
 

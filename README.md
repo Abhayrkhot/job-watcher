@@ -88,6 +88,13 @@ schema.org `JobPosting`), and Qualcomm (the Eightfold search API its careers sit
 calls). Microsoft's careers API answers 429 to an honest client, so it is not read.
 Their first poll is a silent baseline like any other board's.
 
+iCIMS and UKG (UltiPro) boards are read too, and are harvested from Simplify and
+found by Jobright discovery like the others. iCIMS has no JSON, so the portal's search
+page gives job IDs and titles and the job page (its schema.org `JobPosting`) the
+details for new IDs; quiet iCIMS boards are read every 20 minutes. A UKG job board's
+own JSON search gives the newest postings, and its job page embeds the details.
+Avature is not read: its lists are alphabetical a few jobs at a time.
+
 Jobright's hourly public GitHub lists (new-grad software and data roles) name many
 employers Simplify never lists. The watcher reads them once an hour, but never
 jobright.ai itself. For a US employer it doesn't poll, it looks for the employer's
@@ -104,12 +111,12 @@ Software or AI/ML/Data apply link from the past year into a board, and adds the
 boards it doesn't already have, using Simplify's company name. Companies on your
 excluded list are skipped. The new-grad list is also read every 15 minutes, with a
 conditional GET, as a backstop source for roles on systems the watcher can't read
-(iCIMS, custom career sites). A role found both directly and through Simplify is
+(SuccessFactors, Avature, custom career sites). A role found both directly and through Simplify is
 mailed once. Simplify listings carry no description, so a Simplify copy of a job on a
 board the watcher already reads in full (baselined more than a day before the
 listing, and reading cleanly) is dropped; otherwise a posting the direct reader
 rejected for experience, sponsorship, or a clearance would be mailed anyway. For the
-backstop jobs that remain (iCIMS, SuccessFactors, custom career sites), the watcher
+backstop jobs that remain (SuccessFactors, Avature, custom career sites), the watcher
 reads the posting page once before mailing: the schema.org `JobPosting` most career
 pages embed, or else the visible text up to the application form. At most 12 pages
 per run; a page that can't be read leaves the job as it was. See `SOURCE_POLICY.md`.
@@ -242,5 +249,6 @@ but remain eligible for the watcher's 24-hour freshness window.
 LinkedIn, Jobright, Indeed, and similar authenticated boards are not crawled.
 Their native alerts can be used alongside this watcher, but ingesting them cannot
 reliably enforce the 24-hour and US-only rules unless the provider supplies a
-documented API or structured feed. iCIMS, Taleo, Eightfold, and SuccessFactors are
-not read directly; roles there reach the watcher only through the Simplify backstop.
+documented API or structured feed. Taleo, SuccessFactors, and Avature are not read
+directly (nor Eightfold beyond Qualcomm); roles there reach the watcher only through
+the Simplify backstop.
