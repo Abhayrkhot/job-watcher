@@ -3817,5 +3817,30 @@
   {
     "provider": "workable",
     "slug": "quadric-dot-i-o-inc"
+  },
+  {
+    "provider": "amazon",
+    "slug": "amazon",
+    "company": "Amazon"
+  },
+  {
+    "provider": "google",
+    "slug": "google",
+    "company": "Google"
+  },
+  {
+    "provider": "apple",
+    "slug": "apple",
+    "company": "Apple"
+  },
+  {
+    "provider": "meta",
+    "slug": "meta",
+    "company": "Meta"
+  },
+  {
+    "provider": "eightfold",
+    "slug": "careers.qualcomm.com/qualcomm.com",
+    "company": "Qualcomm"
   }
 ]

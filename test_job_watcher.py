@@ -1600,6 +1600,167 @@ class CareerSiteTests(unittest.TestCase):
         self.assertTrue(matches(jobs[0]))
 
 
+class BigTechReaderTests(unittest.TestCase):
+    NOW = int(time.time())
+
+    def test_amazon_reads_the_search_json_without_detail_calls(self):
+        today = time.strftime("%B %d, %Y", time.gmtime(self.NOW)).replace(" 0", " ")
+        payload = {"jobs": [
+            {"id_icims": "101", "title": "Software Development Engineer I", "posted_date": today,
+             "normalized_location": "Seattle, Washington, USA", "location": "US, WA, Seattle",
+             "country_code": "USA", "job_path": "/en/jobs/101/sde-i",
+             "description": "<p>Build services.</p>", "basic_qualifications": "- Bachelor's degree<br/>",
+             "preferred_qualifications": "- Internship experience"},
+            {"id_icims": "99", "title": "Software Development Engineer", "posted_date": "January 2, 2020"},
+        ]}
+        with patch("job_watcher.fetch_json", return_value=payload) as fetch:
+            jobs = job_watcher.fetch_amazon_board({"provider": "amazon", "slug": "amazon", "company": "Amazon"}, self.NOW)
+        self.assertEqual(fetch.call_count, 1)  # under 100 results: one page
+        self.assertEqual([job["id"] for job in jobs], ["amazon:amazon:101"])
+        job = jobs[0]
+        self.assertEqual(job["url"], "https://www.amazon.jobs/en/jobs/101/sde-i")
+        self.assertEqual(job["company_name"], "Amazon")
+        self.assertIn("Bachelor's degree", job["description"])
+        self.assertEqual(job["posted_precision"], "date")
+        self.assertTrue(matches(job))
+
+    def test_amazon_first_poll_is_a_baseline(self):
+        board = {"provider": "amazon", "slug": "amazon", "_baseline": True}
+        with patch("job_watcher.fetch_json", return_value={"jobs": [
+            {"id_icims": str(n), "title": "Software Development Engineer I", "posted_date": "November 27, 2026"}
+            for n in range(100)
+        ]}) as fetch:
+            self.assertEqual(job_watcher.fetch_amazon_board(board, self.NOW), [])
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(len(board["_listed_ids"]), 100)
+
+    def test_google_reads_the_embedded_page_data(self):
+        job = [
+            "1234", "Software Engineer, Early Career", "https://example/signin",
+            [None, "<ul><li>Write code.</li></ul>"], [None, "<p>Bachelor's degree or equivalent.</p>"],
+            "tenant", None, "Google", "en-US",
+            [["Mountain View, CA, USA", ["Mountain View, CA, USA"], "Mountain View", None, "CA", "US"]],
+            [None, "<p>Join Google.</p>"], [2], [self.NOW - 999, 0], [self.NOW - 600, 0], [self.NOW - 600, 0],
+            [None, "This role is not eligible for immigration sponsorship."],
+        ]
+        page = ("<script>AF_initDataCallback({key: 'ds:1', hash: '2', data:"
+                + json.dumps([[job], None, 1, 20]) + ", sideChannel: {}});</script>")
+        with patch("job_watcher.fetch_html", return_value=page) as fetch:
+            jobs = job_watcher.fetch_google_board({"provider": "google", "slug": "google", "company": "Google"}, self.NOW)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(jobs[0]["url"], "https://www.google.com/about/careers/applications/jobs/results/1234")
+        self.assertEqual(jobs[0]["locations"], ["Mountain View, CA, USA", "United States"])
+        self.assertIn("not eligible for immigration sponsorship", jobs[0]["description"])
+        self.assertEqual(rejection_reason(jobs[0], self.NOW), "no_sponsorship")
+
+    def test_google_page_without_job_data_is_an_error(self):
+        with patch("job_watcher.fetch_html", return_value="<html>sorry</html>"):
+            with self.assertRaises(ValueError):
+                job_watcher.fetch_google_board({"provider": "google", "slug": "google"}, self.NOW)
+
+    @staticmethod
+    def apple_page(loader_data):
+        return ("<script>window.__staticRouterHydrationData = JSON.parse("
+                + json.dumps(json.dumps({"loaderData": loader_data})) + ");</script>")
+
+    def test_apple_lists_the_search_page_and_reads_new_job_pages(self):
+        posted = datetime.fromtimestamp(self.NOW - 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.123456789Z")
+        search = self.apple_page({"search": {"searchResults": [
+            {"positionId": "200", "postingTitle": "Software Engineer", "transformedPostingTitle": "software-engineer",
+             "postDateInGMT": posted, "locations": [{"city": "Cupertino", "stateProvince": "California",
+                                                     "countryName": "United States"}]},
+            {"positionId": "201", "postingTitle": "US - Specialist", "transformedPostingTitle": "us-specialist",
+             "postDateInGMT": posted},
+        ]}})
+        detail = self.apple_page({"jobDetails": {"jobsData": {
+            "postingTitle": "Software Engineer", "description": "Build apps.",
+            "minimumQualifications": "BS in Computer Science", "postDateInGMT": posted,
+            "locations": [{"city": "Cupertino", "stateProvince": "California", "countryName": "United States"}],
+        }}})
+        urls = []
+
+        def fetch(url):
+            urls.append(url)
+            return detail if "/details/" in url else search
+
+        with patch("job_watcher.fetch_html", side_effect=fetch):
+            jobs = job_watcher.fetch_apple_board({"provider": "apple", "slug": "apple", "company": "Apple"}, self.NOW)
+        self.assertEqual(urls[-1], "https://jobs.apple.com/en-us/details/200/software-engineer")
+        self.assertEqual(len(urls), 2)  # the retail title is screened out without a page read
+        self.assertEqual(jobs[0]["locations"], ["Cupertino, California, United States"])
+        self.assertIn("BS in Computer Science", jobs[0]["description"])
+        self.assertEqual(jobs[0]["posted_precision"], "time")
+        self.assertTrue(matches(jobs[0]))
+
+    def test_meta_reads_pages_only_for_new_sitemap_ids(self):
+        sitemap = ("<urlset><url><loc>https://www.metacareers.com/profile/job_details/111/</loc></url>"
+                   "<url><loc>https://www.metacareers.com/profile/job_details/222/</loc></url></urlset>")
+        posted = datetime.fromtimestamp(self.NOW - 3600, timezone.utc).isoformat()
+        page = ('<script type="application/ld+json">' + json.dumps({
+            "@context": "https://schema.org", "@type": "JobPosting", "title": "Software Engineer, University Grad",
+            "description": "Build products.", "qualifications": "Currently has, or is in the process of obtaining, a BS",
+            "datePosted": posted, "jobLocation": [{"@type": "Place", "name": "Menlo Park, CA"}],
+            "applicantLocationRequirements": [{"@type": "Country", "name": "United States of America"}],
+        }) + "</script>")
+        urls = []
+
+        def fetch(url):
+            urls.append(url)
+            return sitemap if url.endswith("sitemap.xml") else page
+
+        board = {"provider": "meta", "slug": "meta", "company": "Meta", "_known_ids": frozenset({"111"})}
+        with patch("job_watcher.fetch_html", side_effect=fetch):
+            jobs = job_watcher.fetch_meta_board(board, self.NOW)
+        self.assertEqual(urls, [job_watcher.META_SITEMAP_URL, "https://www.metacareers.com/profile/job_details/222/"])
+        self.assertEqual(jobs[0]["title"], "Software Engineer, University Grad")
+        self.assertEqual(jobs[0]["locations"], ["Menlo Park, CA", "United States of America"])
+        self.assertEqual(sorted(board["_listed_ids"]), ["111", "222"])
+        self.assertTrue(matches(jobs[0]))
+
+    def test_meta_first_poll_reads_no_job_pages(self):
+        board = {"provider": "meta", "slug": "meta", "_baseline": True}
+        sitemap = "".join(f"<loc>https://www.metacareers.com/profile/job_details/{n}/</loc>" for n in range(50))
+        with patch("job_watcher.fetch_html", return_value=sitemap) as fetch:
+            self.assertEqual(job_watcher.fetch_meta_board(board, self.NOW), [])
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(len(board["_listed_ids"]), 50)
+
+    def test_eightfold_search_and_position_details(self):
+        midnight = self.NOW - self.NOW % 86400
+
+        def fetch(url, data=None):
+            if "/search?" in url:
+                self.assertIn("domain=qualcomm.com", url)
+                return {"data": {"positions": [
+                    {"id": 446, "name": "Software Engineer", "locations": ["San Diego, California, United States of America"],
+                     "postedTs": midnight, "positionUrl": "/careers/job/446"},
+                    {"id": 400, "name": "Software Engineer", "postedTs": 1577836800},
+                ]}}
+            self.assertIn("position_id=446", url)
+            return {"data": {"name": "Software Engineer", "jobDescription": "<p>Entry level. Bachelor's degree.</p>",
+                             "publicUrl": "https://careers.qualcomm.com/careers/job/446",
+                             "locations": ["San Diego, California, United States of America"],
+                             "standardizedLocations": ["San Diego, CA, US"]}}
+
+        board = {"provider": "eightfold", "slug": "careers.qualcomm.com/qualcomm.com", "company": "Qualcomm"}
+        with patch("job_watcher.fetch_json", side_effect=fetch):
+            jobs = job_watcher.fetch_eightfold_board(board, self.NOW)
+        self.assertEqual([job["url"] for job in jobs], ["https://careers.qualcomm.com/careers/job/446"])
+        self.assertEqual(jobs[0]["posted_at"], time.strftime("%Y-%m-%d", time.gmtime(midnight)))
+        self.assertIn("United States", jobs[0]["locations"])
+        self.assertEqual(jobs[0]["company_name"], "Qualcomm")
+
+    def test_big_tech_links_map_to_their_boards(self):
+        amazon = job_watcher.board_from_url("https://www.amazon.jobs/en/jobs/101/sde", "Amazon Web Services")
+        self.assertEqual((amazon["provider"], amazon["slug"], amazon["company"]), ("amazon", "amazon", "Amazon"))
+        google = job_watcher.board_from_url("https://www.google.com/about/careers/applications/jobs/results/1-swe")
+        self.assertEqual(google["provider"], "google")
+        self.assertIsNone(job_watcher.board_from_url("https://www.google.com/search?q=jobs"))
+        qualcomm = job_watcher.board_from_url("https://careers.qualcomm.com/careers/job/446")
+        self.assertEqual(qualcomm["slug"], "careers.qualcomm.com/qualcomm.com")
+        self.assertIsNot(amazon, job_watcher.BIG_TECH_HOSTS["www.amazon.jobs"])
+
+
 class ConditionalFetchTests(unittest.TestCase):
     class Response:
         def __init__(self, body, headers):

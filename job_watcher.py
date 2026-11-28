@@ -65,6 +65,7 @@ FILTER_NO_SPONSORSHIP = os.environ.get("JOB_WATCHER_KEEP_NO_SPONSORSHIP") != "1"
 SUPPORTED_PROVIDERS = {
     "ashby", "greenhouse", "lever", "lever-eu", "recruitee", "smartrecruiters",
     "workable", "workday", "oracle", "bamboohr", "rippling", "jobvite", "jazzhr",
+    "amazon", "google", "apple", "meta", "eightfold",
 }
 # --- Role filter --------------------------------------------------------------
 # Recall first: accept anything in the software / data / ML area and reject only
@@ -1469,6 +1470,7 @@ def read_board(board: dict) -> list[dict]:
 
 DETAIL_PROVIDERS = {
     "greenhouse", "smartrecruiters", "workday", "oracle", "bamboohr", "rippling", "jobvite",
+    "amazon", "google", "apple", "meta", "eightfold",
 }
 MAX_DETAIL_FETCHES_PER_BOARD = 25
 WORKDAY_PAGE_SIZE = 20
@@ -1527,13 +1529,16 @@ class DetailPlan:
         self.handled: list[str] = []
         self.fresh: list[tuple] = []
 
-    def consider(self, job_id: object, title: object, recent: bool = True, payload=None) -> None:
+    def consider(self, job_id: object, title: object, recent: bool = True, payload=None,
+                 screen_title: bool = True) -> None:
+        """screen_title=False is for lists that carry no titles (Meta's sitemap): the
+        role filter then runs on the fetched details instead."""
         job_id = str(job_id)
         if not job_id or job_id in self.known:
             if job_id:
                 self.handled.append(job_id)
             return
-        if self.baseline or not recent or title_rejection(title):
+        if self.baseline or not recent or (screen_title and title_rejection(title)):
             self.handled.append(job_id)
             return
         self.fresh.append((job_id, payload))
@@ -1880,7 +1885,267 @@ def fetch_smartrecruiters_board(board: dict, now: int) -> list[dict]:
     return plan.details(one)
 
 
+# --- Big-tech career sites ------------------------------------------------------------
+# Enabled on 2026-11-27 by the owner's decision (see SOURCE_POLICY.md). These companies
+# run their own career sites rather than a shared ATS, so the Simplify harvest never
+# found them. Each reader uses what the public careers site itself serves, with no
+# login or cookies: Amazon's search JSON, the search pages Google and Apple render on
+# the server, Meta's job sitemap and job pages, and the Eightfold search API that
+# Qualcomm's site calls. Microsoft's careers API answers 429 to an honest client, so it
+# is not read. Like the other readers, a poll lists the newest postings and fetches
+# details only for new IDs whose title passes the filter.
+BIG_TECH_MAX_PAGES = 3
+AMAZON_SEARCH_URL = (
+    "https://www.amazon.jobs/en/search.json?category%5B%5D=software-development"
+    "&category%5B%5D=machine-learning-science&category%5B%5D=data-science"
+    "&normalized_country_code%5B%5D=USA&result_limit=100&sort=recent&offset={offset}"
+)
+GOOGLE_SEARCH_URL = (
+    "https://www.google.com/about/careers/applications/jobs/results/"
+    "?location=United%20States&target_level=EARLY&sort_by=date&page={page}"
+)
+GOOGLE_JOB_URL = "https://www.google.com/about/careers/applications/jobs/results/{id}"
+APPLE_SEARCH_URL = "https://jobs.apple.com/en-us/search?sort=newest&location=united-states-USA&page={page}"
+APPLE_JOB_URL = "https://jobs.apple.com/en-us/details/{id}/{name}"
+META_SITEMAP_URL = "https://www.metacareers.com/jobs/sitemap.xml"
+META_JOB_URL = "https://www.metacareers.com/profile/job_details/{id}/"
+EIGHTFOLD_PAGE_SIZE = 10
+EIGHTFOLD_MAX_PAGES = 5
+APPLE_HYDRATION_RE = re.compile(r"window\.__staticRouterHydrationData\s*=\s*JSON\.parse\((\".*?\")\);", re.S)
+META_JOB_ID_RE = re.compile(r"/job_details/(\d+)/")
+FRACTIONAL_SECONDS_RE = re.compile(r"(\.\d{6})\d+")
+
+
+def fetch_html(url: str) -> str:
+    request = urllib.request.Request(url, headers={
+        "User-Agent": "personal-new-grad-job-watcher/1.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml",
+        "Accept-Encoding": "gzip",
+    })
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = response.read()
+        if response.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+        return body.decode(response.headers.get_content_charset() or "utf-8", "replace")
+
+
+def is_fresh(timestamp: int | None, now: int) -> bool:
+    return timestamp is None or now - timestamp <= FRESH_DATE_SECONDS
+
+
+def iso_day(timestamp: int) -> str:
+    return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d")
+
+
+def fetch_amazon_board(board: dict, now: int) -> list[dict]:
+    plan = DetailPlan(board)
+    for page in range(BIG_TECH_MAX_PAGES):
+        payload = fetch_json(AMAZON_SEARCH_URL.format(offset=page * 100))
+        items = payload.get("jobs") or []
+        days = []
+        for item in items:
+            try:  # "November 27, 2026"
+                day = datetime.strptime(str(item.get("posted_date")), "%B %d, %Y").strftime("%Y-%m-%d")
+            except ValueError:
+                day = None
+            stamp = parse_job_datetime(day)
+            days.append(stamp)
+            plan.consider(item.get("id_icims") or item.get("id"), item.get("title"),
+                          is_fresh(stamp, now), {**item, "_day": day})
+        if plan.baseline or len(items) < 100 or not any(is_fresh(stamp, now) for stamp in days):
+            break
+
+    def one(job_id, item):
+        locations = [item.get("normalized_location"), item.get("location")]
+        if item.get("country_code") == "USA":
+            locations.append("United States")
+        return with_posting(direct_job(
+            board, job_id, str(item.get("title") or ""),
+            [str(value) for value in locations if value],
+            f'https://www.amazon.jobs{item.get("job_path") or f"/en/jobs/{job_id}"}',
+            plain_text("\n".join(str(item.get(key) or "") for key in (
+                "description", "basic_qualifications", "preferred_qualifications"
+            ))),
+            None,
+        ), item.get("_day"), now)
+
+    return plan.details(one)
+
+
+def google_text(value: object) -> str:
+    """Google's page data holds rich text as [null, "<html>"] pairs."""
+    if isinstance(value, list) and len(value) == 2 and value[0] is None and isinstance(value[1], str):
+        return plain_text(value[1])
+    return ""
+
+
+def google_jobs(page_html: str) -> tuple[list, int]:
+    start = page_html.find("AF_initDataCallback({key: 'ds:1'")
+    data_at = page_html.find("data:", start) if start >= 0 else -1
+    if data_at < 0:
+        raise ValueError("Google careers page has no job data")
+    data, _ = json.JSONDecoder().raw_decode(page_html, data_at + len("data:"))
+    jobs = data[0] or []
+    total = data[2] if len(data) > 2 and isinstance(data[2], int) else len(jobs)
+    return jobs, total
+
+
+def fetch_google_board(board: dict, now: int) -> list[dict]:
+    plan = DetailPlan(board)
+    for page in range(1, BIG_TECH_MAX_PAGES + 1):
+        jobs, total = google_jobs(fetch_html(GOOGLE_SEARCH_URL.format(page=page)))
+        stamps = []
+        for item in jobs:
+            published = item[13][0] if len(item) > 13 and isinstance(item[13], list) and item[13] else None
+            stamp = parse_job_datetime(published)
+            stamps.append(stamp)
+            plan.consider(item[0], item[1], is_fresh(stamp, now), {"item": item, "published": published})
+        if plan.baseline or not jobs or page * len(jobs) >= total or not any(is_fresh(s, now) for s in stamps):
+            break
+
+    def one(job_id, payload):
+        item = payload["item"]
+        locations = [str(entry[0]) for entry in item[9] or [] if isinstance(entry, list) and entry]
+        if any(isinstance(entry, list) and entry and entry[-1] == "US" for entry in item[9] or []):
+            locations.append("United States")
+        description = "\n".join(filter(None, (google_text(value) for value in item)))
+        return with_posting(direct_job(
+            board, job_id, str(item[1] or ""), locations,
+            GOOGLE_JOB_URL.format(id=job_id), description, None,
+        ), payload["published"], now)
+
+    return plan.details(one)
+
+
+def apple_data(page_html: str) -> dict:
+    match = APPLE_HYDRATION_RE.search(page_html)
+    if not match:
+        raise ValueError("Apple jobs page has no hydration data")
+    return json.loads(json.loads(match.group(1))).get("loaderData") or {}
+
+
+def apple_locations(entries: object) -> list[str]:
+    locations = []
+    for entry in entries or []:
+        if isinstance(entry, dict):
+            locations.append(", ".join(filter(None, (
+                entry.get("city"), entry.get("stateProvince"), entry.get("countryName")
+            ))) or str(entry.get("name") or ""))
+    return [location for location in locations if location]
+
+
+def fetch_apple_board(board: dict, now: int) -> list[dict]:
+    plan = DetailPlan(board)
+    for page in range(1, BIG_TECH_MAX_PAGES + 1):
+        results = (apple_data(fetch_html(APPLE_SEARCH_URL.format(page=page))).get("search") or {}).get(
+            "searchResults") or []
+        stamps = []
+        for item in results:
+            stamp = parse_job_datetime(FRACTIONAL_SECONDS_RE.sub(r"\1", str(item.get("postDateInGMT") or "")))
+            stamps.append(stamp)
+            plan.consider(item.get("positionId"), item.get("postingTitle"), is_fresh(stamp, now), item)
+        if plan.baseline or len(results) < 20 or not any(is_fresh(s, now) for s in stamps):
+            break
+
+    def one(job_id, item):
+        url = APPLE_JOB_URL.format(id=job_id, name=item.get("transformedPostingTitle") or "job")
+        detail = (apple_data(fetch_html(url)).get("jobDetails") or {}).get("jobsData") or {}
+        posted = FRACTIONAL_SECONDS_RE.sub(r"\1", str(detail.get("postDateInGMT") or item.get("postDateInGMT") or ""))
+        return with_posting(direct_job(
+            board, job_id, str(detail.get("postingTitle") or item.get("postingTitle") or ""),
+            apple_locations(detail.get("locations") or item.get("locations")), url,
+            plain_text("\n".join(str(detail.get(key) or item.get(key) or "") for key in (
+                "jobSummary", "description", "responsibilities",
+                "minimumQualifications", "preferredQualifications",
+            ))),
+            None,
+        ), posted or None, now)
+
+    return plan.details(one)
+
+
+def fetch_meta_board(board: dict, now: int) -> list[dict]:
+    """Meta's sitemap lists every open job's page but no titles or dates, so each new
+    ID's page is read (its schema.org JobPosting) and the filter runs on that."""
+    plan = DetailPlan(board)
+    for job_id in dict.fromkeys(META_JOB_ID_RE.findall(fetch_html(META_SITEMAP_URL))):
+        plan.consider(job_id, None, True, None, screen_title=False)
+
+    def one(job_id, _):
+        url = META_JOB_URL.format(id=job_id)
+        page_html = fetch_html(url)
+        posting = {}
+        for block in LD_JSON_RE.findall(page_html):
+            try:
+                posting = next(job_postings(json.loads(block)), {}) or posting
+            except ValueError:
+                continue
+        if not posting:
+            raise ValueError("Meta job page has no JobPosting data")
+        places = posting.get("jobLocation") or []
+        places = places if isinstance(places, list) else [places]
+        locations = [str(place.get("name") or "") for place in places if isinstance(place, dict)]
+        requirements = posting.get("applicantLocationRequirements") or []
+        requirements = requirements if isinstance(requirements, list) else [requirements]
+        locations += [str(place.get("name") or "") for place in requirements if isinstance(place, dict)]
+        return with_posting(direct_job(
+            board, job_id, html.unescape(str(posting.get("title") or "")),
+            [location for location in locations if location], url,
+            plain_text("\n".join(str(posting.get(key) or "") for key in (
+                "description", "responsibilities", "qualifications"
+            ))),
+            None,
+        ), posting.get("datePosted"), now)
+
+    return plan.details(one)
+
+
+def fetch_eightfold_board(board: dict, now: int) -> list[dict]:
+    """Eightfold's PCSX careers sites (Qualcomm). The slug is "<careers host>/<domain>"."""
+    host, domain = str(board["slug"]).split("/", 1)
+    api = f"https://{host}/api/pcsx"
+    plan = DetailPlan(board)
+    for page in range(EIGHTFOLD_MAX_PAGES):
+        payload = fetch_json(
+            f"{api}/search?domain={urllib.parse.quote(domain)}&query=&location=United%20States"
+            f"&start={page * EIGHTFOLD_PAGE_SIZE}&sort_by=timestamp"
+        )
+        positions = (payload.get("data") or {}).get("positions") or []
+        stamps = []
+        for item in positions:
+            stamp = parse_job_datetime(item.get("postedTs") or item.get("creationTs"))
+            stamps.append(stamp)
+            plan.consider(item.get("id"), item.get("name"), is_fresh(stamp, now), {**item, "_stamp": stamp})
+        if (plan.baseline or len(positions) < EIGHTFOLD_PAGE_SIZE
+                or not any(is_fresh(stamp, now) for stamp in stamps)):
+            break
+
+    def one(job_id, item):
+        detail = fetch_json(
+            f"{api}/position_details?position_id={urllib.parse.quote(job_id)}"
+            f"&domain={urllib.parse.quote(domain)}&hl=en"
+        ).get("data") or {}
+        locations = [str(value) for value in detail.get("locations") or item.get("locations") or []]
+        if any(str(value).endswith((", US", "United States of America")) for value in
+               (detail.get("standardizedLocations") or []) + locations):
+            locations.append("United States")
+        stamp = item.get("_stamp")
+        return with_posting(direct_job(
+            board, job_id, str(detail.get("name") or item.get("name") or ""), locations,
+            str(detail.get("publicUrl") or f"https://{host}{item.get('positionUrl') or ''}"),
+            plain_text(str(detail.get("jobDescription") or "")),
+            None,
+        ), iso_day(stamp) if stamp else None, now)
+
+    return plan.details(one)
+
+
 CAREER_SITE_FETCHERS = {
+    "amazon": fetch_amazon_board,
+    "google": fetch_google_board,
+    "apple": fetch_apple_board,
+    "meta": fetch_meta_board,
+    "eightfold": fetch_eightfold_board,
     "greenhouse": fetch_greenhouse_board,
     "smartrecruiters": fetch_smartrecruiters_board,
     "workday": fetch_workday_board,
@@ -1961,6 +2226,19 @@ SIMPLIFY_SPONSORSHIP_TEXT = {
 }
 
 
+# The big-tech career sites each have one board (see "Big-tech career sites").
+BIG_TECH_HOSTS = {
+    "www.amazon.jobs": {"provider": "amazon", "slug": "amazon", "company": "Amazon"},
+    "amazon.jobs": {"provider": "amazon", "slug": "amazon", "company": "Amazon"},
+    "www.google.com": {"provider": "google", "slug": "google", "company": "Google"},
+    "jobs.apple.com": {"provider": "apple", "slug": "apple", "company": "Apple"},
+    "www.metacareers.com": {"provider": "meta", "slug": "meta", "company": "Meta"},
+    "metacareers.com": {"provider": "meta", "slug": "meta", "company": "Meta"},
+    "careers.qualcomm.com": {"provider": "eightfold", "slug": "careers.qualcomm.com/qualcomm.com",
+                             "company": "Qualcomm"},
+}
+
+
 def board_from_url(url: str, company: str = "") -> dict | None:
     parts = urllib.parse.urlsplit(str(url or ""))
     host = parts.netloc.lower().split(":")[0]
@@ -2003,9 +2281,11 @@ def board_from_url(url: str, company: str = "") -> dict | None:
         board = segments and {"provider": "rippling", "slug": segments[0]}
     elif host.endswith(".recruitee.com"):
         board = {"provider": "recruitee", "slug": host.split(".")[0]}
+    elif host in BIG_TECH_HOSTS and (host != "www.google.com" or path[:2] == ["about", "careers"]):
+        board = dict(BIG_TECH_HOSTS[host])
     if not board:
         return None
-    if company:
+    if company and not board.get("company"):
         board["company"] = company
     return board
 

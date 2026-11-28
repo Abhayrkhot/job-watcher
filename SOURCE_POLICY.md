@@ -40,8 +40,27 @@ read at the cadence of the watcher's normal polling.
 
 All readers share the global limits: 8 concurrent requests, at most 25 detail
 fetches per board per poll, and the first poll of a board records existing IDs
-without fetching any details. iCIMS, Taleo, Eightfold, and SuccessFactors boards are
-not polled.
+without fetching any details. iCIMS, Taleo, and SuccessFactors boards are not
+polled, and Eightfold only for the company listed below.
+
+### Big-tech career sites
+
+Enabled on 2026-11-27 by the owner's decision. These companies run their own career
+sites instead of a shared ATS. Each is read the way its public careers site serves
+it, with no login or cookies and an honest User-Agent, at the watcher's normal
+polling cadence (one board per company).
+
+| Company | Endpoint | Constraints |
+| --- | --- | --- |
+| Amazon | `GET https://www.amazon.jobs/en/search.json` (US; software development, machine learning science, data science; newest first) | 100 per page, at most 3 pages while they hold postings from the last two days; the list carries full postings, so no detail calls |
+| Google | `GET https://www.google.com/about/careers/applications/jobs/results/` (US, early career, newest first); job data is embedded in the page | 20 per page, at most 3 pages; no detail calls |
+| Apple | `GET https://jobs.apple.com/en-us/search` (US, newest first), then `GET /en-us/details/<id>/<title>` for new IDs; data is embedded in each page | 20 per page, at most 3 pages; job pages only for new IDs whose title passes the filter |
+| Meta | `GET https://www.metacareers.com/jobs/sitemap.xml`, then `GET /profile/job_details/<id>/` for new IDs, reading the schema.org `JobPosting` | Sitemap once per poll; job pages only for new IDs, at most 25 per poll |
+| Qualcomm (Eightfold) | `GET https://careers.qualcomm.com/api/pcsx/search` (US, newest first) and `/api/pcsx/position_details` | 10 per page, at most 5 pages; details only for new IDs |
+
+Microsoft's careers search API (`apply.careers.microsoft.com/api/pcsx/search`)
+answered 429 to every request from an honest client on 2026-11-27, from two
+networks, so it is not read.
 
 ## Posting pages for Simplify backstop jobs
 

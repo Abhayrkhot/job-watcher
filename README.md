@@ -78,6 +78,16 @@ cheaply and fetch the full posting only for job IDs they haven't seen. When a
 provider gives only a posting date, a job seen for the first time within two days
 of that date is stamped with the time it was detected.
 
+Five big employers run their own career sites, which the Simplify harvest never
+finds, so they have their own readers and one board each: Amazon (the
+`amazon.jobs` search JSON, US software, ML and data science roles), Google (the
+early-career search page, whose job data is embedded in the HTML), Apple (the
+newest US postings from the search page, then the job page for new IDs whose title
+passes), Meta (the public job sitemap for new IDs, then each new job page's
+schema.org `JobPosting`), and Qualcomm (the Eightfold search API its careers site
+calls). Microsoft's careers API answers 429 to an honest client, so it is not read.
+Their first poll is a silent baseline like any other board's.
+
 The registry grows on its own. Once a day the watcher reads SimplifyJobs' public
 New-Grad-Positions and Summer2027-Internships `listings.json`. It turns every
 Software or AI/ML/Data apply link from the past year into a board, and adds the
