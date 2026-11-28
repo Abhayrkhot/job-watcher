@@ -39,8 +39,8 @@ read at the cadence of the watcher's normal polling.
 | SimplifyJobs lists | `listings.json` from the public New-Grad-Positions and Summer2027-Internships GitHub repos | Conditional GET with gzip; board discovery at most daily; new-grad list at most every 15 minutes |
 
 All readers share the global limits: 8 concurrent requests, at most 25 detail
-fetches per board per poll, and the first poll of a board records existing IDs
-without fetching any details. Taleo, SuccessFactors, and Avature boards are not
+fetches per board per poll, and the first poll of a board records existing IDs,
+fetching details only for postings its list dates within the last day. Taleo, SuccessFactors, and Avature boards are not
 polled, and Eightfold only for the company listed below.
 
 ### iCIMS and UKG

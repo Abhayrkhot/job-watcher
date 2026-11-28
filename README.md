@@ -86,7 +86,7 @@ newest US postings from the search page, then the job page for new IDs whose tit
 passes), Meta (the public job sitemap for new IDs, then each new job page's
 schema.org `JobPosting`), and Qualcomm (the Eightfold search API its careers site
 calls). Microsoft's careers API answers 429 to an honest client, so it is not read.
-Their first poll is a silent baseline like any other board's.
+Their first poll is a baseline like any other board's.
 
 iCIMS and UKG (UltiPro) boards are read too, and are harvested from Simplify and
 found by Jobright discovery like the others. iCIMS has no JSON, so the portal's search
@@ -172,9 +172,13 @@ provider, with a `migrated_from` field recording the old key. The move is logged
 as `Board moved:` in `state/watcher.log`. Because a slug can belong to a different
 company with the same name, review those lines occasionally.
 
-A board's first successful poll creates a silent
-baseline; only later matching postings are mailed. Jobs must have a detectable
-posted timestamp within the last 24 hours to be eligible.
+A board's first successful poll creates a baseline: what is already open is
+recorded, not mailed, so a new board doesn't flood the inbox. The exception is a
+matching posting the source itself dates within the last 24 hours (a timestamp, or
+today's date), which is as new as anything a later poll would find, so it is mailed;
+readers that list cheaply fetch details at the first poll only for such postings. A
+job known only by when the watcher first saw it is never mailed from a first poll.
+Jobs must have a detectable posted timestamp within the last 24 hours to be eligible.
 
 Approved public RSS, Atom, JSON, and JazzHR customer XML feeds can be configured
 in `state/feeds.json`. Feed polling runs no more often than every 15 minutes. A feed must be explicitly

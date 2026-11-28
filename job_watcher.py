@@ -1536,15 +1536,17 @@ class DetailPlan:
         self.fresh: list[tuple] = []
 
     def consider(self, job_id: object, title: object, recent: bool = True, payload=None,
-                 screen_title: bool = True) -> None:
+                 screen_title: bool = True, just_posted: bool = False) -> None:
         """screen_title=False is for lists that carry no titles (Meta's sitemap): the
-        role filter then runs on the fetched details instead."""
+        role filter then runs on the fetched details instead. just_posted says the list
+        itself dates the job within the last day: on a board's first poll only those
+        jobs get details (so they can be alerted); the rest are just recorded."""
         job_id = str(job_id)
         if not job_id or job_id in self.known:
             if job_id:
                 self.handled.append(job_id)
             return
-        if self.baseline or not recent or (screen_title and title_rejection(title)):
+        if (self.baseline and not just_posted) or not recent or (screen_title and title_rejection(title)):
             self.handled.append(job_id)
             return
         self.fresh.append((job_id, payload))
@@ -1646,6 +1648,7 @@ def fetch_workday_board(board: dict, now: int) -> list[dict]:
                 plan.consider(
                     path.rstrip("/").rsplit("/", 1)[-1], posting.get("title"),
                     workday_posted_days(posting.get("postedOn")) <= 1, (path, posting),
+                    just_posted=workday_posted_days(posting.get("postedOn")) == 0,
                 )
         ages = [workday_posted_days(posting.get("postedOn")) for posting in postings]
         if (not postings or min(ages) > 1 or plan.baseline
@@ -1681,7 +1684,8 @@ def fetch_oracle_board(board: dict, now: int) -> list[dict]:
     for item in items:
         posted = parse_job_datetime(item.get("PostedDate"))
         plan.consider(item.get("Id"), item.get("Title"),
-                      posted is None or now - posted <= FRESH_DATE_SECONDS, item)
+                      posted is None or now - posted <= FRESH_DATE_SECONDS, item,
+                      just_posted=in_alert_window(posted, now))
 
     def one(job_id, item):
         detail = (fetch_json(
@@ -1834,7 +1838,8 @@ def fetch_greenhouse_board(board: dict, now: int) -> list[dict]:
     for item in payload.get("jobs") or []:
         published = parse_job_datetime(item.get("first_published") or item.get("updated_at"))
         plan.consider(item.get("id"), item.get("title"),
-                      published is not None and now - published <= MAX_JOB_AGE_SECONDS, item)
+                      published is not None and now - published <= MAX_JOB_AGE_SECONDS, item,
+                      just_posted=in_alert_window(published, now))
 
     def one(job_id, item):
         detail = fetch_json(f"{base}/{job_id}") or {}
@@ -1862,7 +1867,8 @@ def fetch_smartrecruiters_board(board: dict, now: int) -> list[dict]:
         items = payload.get("content") or []
         for item in items:
             posted = item.get("releasedDate") or item.get("releaseDate") or item.get("createdOn")
-            plan.consider(item.get("id"), item.get("name"), source_timestamp_is_recent(posted, now), item)
+            plan.consider(item.get("id"), item.get("name"), source_timestamp_is_recent(posted, now), item,
+                          just_posted=source_timestamp_is_recent(posted, now))
         offset += len(items)
         if not items or plan.baseline or offset >= int(payload.get("totalFound") or 0):
             break
@@ -1939,6 +1945,12 @@ def is_fresh(timestamp: int | None, now: int) -> bool:
     return timestamp is None or now - timestamp <= FRESH_DATE_SECONDS
 
 
+def in_alert_window(timestamp: int | None, now: int) -> bool:
+    """Posted within the last day by the source's own date. A date without a time
+    counts as midnight UTC, so only a job dated today qualifies."""
+    return timestamp is not None and -FUTURE_TIMESTAMP_GRACE_SECONDS <= now - timestamp <= MAX_JOB_AGE_SECONDS
+
+
 def iso_day(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d")
 
@@ -1957,7 +1969,7 @@ def fetch_amazon_board(board: dict, now: int) -> list[dict]:
             stamp = parse_job_datetime(day)
             days.append(stamp)
             plan.consider(item.get("id_icims") or item.get("id"), item.get("title"),
-                          is_fresh(stamp, now), {**item, "_day": day})
+                          is_fresh(stamp, now), {**item, "_day": day}, just_posted=in_alert_window(stamp, now))
         if plan.baseline or len(items) < 100 or not any(is_fresh(stamp, now) for stamp in days):
             break
 
@@ -2005,7 +2017,8 @@ def fetch_google_board(board: dict, now: int) -> list[dict]:
             published = item[13][0] if len(item) > 13 and isinstance(item[13], list) and item[13] else None
             stamp = parse_job_datetime(published)
             stamps.append(stamp)
-            plan.consider(item[0], item[1], is_fresh(stamp, now), {"item": item, "published": published})
+            plan.consider(item[0], item[1], is_fresh(stamp, now), {"item": item, "published": published},
+                          just_posted=in_alert_window(stamp, now))
         if plan.baseline or not jobs or page * len(jobs) >= total or not any(is_fresh(s, now) for s in stamps):
             break
 
@@ -2049,7 +2062,8 @@ def fetch_apple_board(board: dict, now: int) -> list[dict]:
         for item in results:
             stamp = parse_job_datetime(FRACTIONAL_SECONDS_RE.sub(r"\1", str(item.get("postDateInGMT") or "")))
             stamps.append(stamp)
-            plan.consider(item.get("positionId"), item.get("postingTitle"), is_fresh(stamp, now), item)
+            plan.consider(item.get("positionId"), item.get("postingTitle"), is_fresh(stamp, now), item,
+                          just_posted=in_alert_window(stamp, now))
         if plan.baseline or len(results) < 20 or not any(is_fresh(s, now) for s in stamps):
             break
 
@@ -2121,7 +2135,8 @@ def fetch_eightfold_board(board: dict, now: int) -> list[dict]:
         for item in positions:
             stamp = parse_job_datetime(item.get("postedTs") or item.get("creationTs"))
             stamps.append(stamp)
-            plan.consider(item.get("id"), item.get("name"), is_fresh(stamp, now), {**item, "_stamp": stamp})
+            plan.consider(item.get("id"), item.get("name"), is_fresh(stamp, now), {**item, "_stamp": stamp},
+                          just_posted=in_alert_window(stamp, now))
         if (plan.baseline or len(positions) < EIGHTFOLD_PAGE_SIZE
                 or not any(is_fresh(stamp, now) for stamp in stamps)):
             break
@@ -2267,7 +2282,8 @@ def fetch_ukg_board(board: dict, now: int) -> list[dict]:
         for item in items:
             stamp = parse_job_datetime(FRACTIONAL_SECONDS_RE.sub(r"\1", str(item.get("PostedDate") or "")))
             stamps.append(stamp)
-            plan.consider(item.get("Id"), item.get("Title"), is_fresh(stamp, now), item)
+            plan.consider(item.get("Id"), item.get("Title"), is_fresh(stamp, now), item,
+                          just_posted=in_alert_window(stamp, now))
         if plan.baseline or len(items) < UKG_PAGE_SIZE or not any(is_fresh(stamp, now) for stamp in stamps):
             break
 
@@ -3758,7 +3774,7 @@ def source_candidates(
                 "INSERT OR IGNORE INTO initialized_boards(board_key) VALUES (?)",
                 (source_key,),
             )
-            return [], True
+            return first_poll_alerts(connection, [job for job in jobs if matches(job)]), True
         detected_at = int(time.time())
         for job in jobs:
             if stable_id(job) not in observed:
@@ -3774,12 +3790,28 @@ def source_candidates(
         "SELECT 1 FROM initialized_boards WHERE board_key = ?", (source_key,)
     ).fetchone()
     if not initialized:
-        record_jobs(connection, matching)
+        alerts = first_poll_alerts(connection, matching)
+        record_jobs(connection, [job for job in matching if job not in alerts])
         connection.execute(
             "INSERT OR IGNORE INTO initialized_boards(board_key) VALUES (?)", (source_key,)
         )
-        return [], True
+        return alerts, True
     return [job for job in matching if not job_seen(connection, job)], False
+
+
+def first_poll_alerts(connection: sqlite3.Connection, matching: list[dict]) -> list[dict]:
+    """The first poll of a board records what is already open without mailing it, so
+    a new board does not flood the inbox. Matching jobs the source itself dates within
+    the last day are the exception: they are as new as anything a later poll would
+    find (on 2026-11-26 a newly harvested board swallowed two Ayo Semiconductor ML roles
+    this way). A job known only as "first seen now" does not count."""
+    now = int(time.time())
+    return [
+        job for job in matching
+        if job.get("posted_precision") != "unknown"
+        and in_alert_window(parse_job_datetime(job.get("posted_at")), now)
+        and not job_seen(connection, job)
+    ]
 
 DIGEST_TITLE_TERMS = [
     "software engineer",

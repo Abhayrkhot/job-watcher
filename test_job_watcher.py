@@ -320,6 +320,33 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(candidates[0]["posted_at"], 1)
         self.assertIn("detected_at", candidates[0])
 
+    def test_first_poll_mails_only_matches_the_source_dates_today(self):
+        directory = Path(tempfile.mkdtemp())
+        with patch("job_watcher.DB_PATH", directory / "jobs.sqlite3"), patch("job_watcher.STATE_DIR", directory):
+            connection = job_watcher.connect_db()
+        self.addCleanup(connection.close)
+        now = int(time.time())
+
+        def job(name, title, **fields):
+            return {**self.job(title), "id": f"lever:acme:{name}",
+                    "company_name": "Acme", "url": f"https://jobs.lever.co/acme/{name}", **fields}
+
+        fresh = job("fresh", "Software Engineer - New Grad", posted_at=now - 3600, posted_precision="time")
+        today = job("today", "Data Engineer - New Grad", posted_at=time.strftime("%Y-%m-%d", time.gmtime(now)),
+                    posted_precision="date", detected_at=now)
+        yesterday = job("yesterday", "Machine Learning Engineer I",
+                        posted_at=time.strftime("%Y-%m-%d", time.gmtime(now - 86400)),
+                        posted_precision="date", detected_at=now)
+        unknown = job("unknown", "Data Scientist - Entry Level", posted_at=None, posted_precision="unknown",
+                      detected_at=now)
+        candidates, initialized = source_candidates(connection, "lever:acme", [fresh, today, yesterday, unknown])
+        self.assertTrue(initialized)
+        self.assertEqual([candidate["id"] for candidate in candidates], ["lever:acme:fresh", "lever:acme:today"])
+        # The others were recorded at the baseline, so a later poll does not mail them either.
+        candidates, initialized = source_candidates(connection, "lever:acme", [fresh, today, yesterday, unknown])
+        self.assertFalse(initialized)
+        self.assertEqual([candidate["id"] for candidate in candidates], ["lever:acme:fresh", "lever:acme:today"])
+
     @patch("job_watcher.fetch_text")
     def test_approved_feed_normalization_does_not_assume_us(self, fetch_text):
         fetch_text.return_value = json.dumps({"items": [{
@@ -1235,16 +1262,20 @@ class MainRunTests(unittest.TestCase):
         self.assertEqual(stats["lever:acme"][1:], (0, 1))
         self.assertEqual(job_watcher.board_interval_seconds(1, 0, "workday"), job_watcher.HOT_POLL_SECONDS)
 
-    def test_workday_baseline_then_new_job_is_emailed(self):
+    def test_workday_first_poll_mails_only_todays_postings_then_new_ones(self):
         board = {"provider": "workday", "slug": "acme.wd5.myworkdayjobs.com/acme/Careers", "company": "Acme"}
-        postings = [{"title": "Software Engineer", "externalPath": "/job/NYC/SE_R-1", "postedOn": "Posted Today"}]
+        postings = [
+            {"title": "Software Engineer", "externalPath": "/job/NYC/SE_R-1", "postedOn": "Posted Today"},
+            {"title": "Software Engineer", "externalPath": "/job/NYC/SE_R-0", "postedOn": "Posted 30+ Days Ago"},
+        ]
         detail_calls = []
 
         def fetch_json(url, data=None):
             if url.endswith("/jobs"):
                 return {"total": len(postings), "jobPostings": list(postings)}
             detail_calls.append(url)
-            return {"jobPostingInfo": {"title": "Software Engineer, New Grad", "jobDescription": "Build.",
+            title = {"SE_R-1": "Software Engineer I"}.get(url.rsplit("/", 1)[1], "Software Engineer, New Grad")
+            return {"jobPostingInfo": {"title": title, "jobDescription": "Build.",
                                        "location": "New York, NY", "startDate": TODAY}}
 
         with patch("job_watcher.fetch_json", side_effect=fetch_json), \
@@ -1264,13 +1295,14 @@ class MainRunTests(unittest.TestCase):
                     patch("job_watcher.sys.argv", ["job_watcher.py"]), \
                     patch("job_watcher.send_push"), \
                     patch("job_watcher.send_email") as send_email:
-                job_watcher.main()                      # first poll: baseline
-                self.assertEqual(detail_calls, [])
-                send_email.assert_not_called()
+                job_watcher.main()                      # first poll: records both, reads today's
+                self.assertEqual([url.rsplit("/", 1)[1] for url in detail_calls], ["SE_R-1"])
+                self.assertEqual(len(send_email.call_args[0][0]), 1)
+                send_email.reset_mock()
                 postings.insert(0, {"title": "Software Engineer, New Grad",
                                     "externalPath": "/job/NYC/SE-NG_R-2", "postedOn": "Posted Today"})
                 job_watcher.main()                      # second poll: one new id
-                self.assertEqual(len(detail_calls), 1)
+                self.assertEqual(len(detail_calls), 2)
                 self.assertEqual([job["title"] for job in send_email.call_args[0][0]],
                                  ["Software Engineer, New Grad"])
 
@@ -1513,6 +1545,28 @@ class CareerSiteTests(unittest.TestCase):
             now += 240
         self.assertEqual(len(last_read), 40)
         self.assertLessEqual(longest_gap, 30 * 60)  # 40 boards / 8 per run * 4 min = 20 min a pass
+
+    def test_first_poll_reads_details_only_for_jobs_the_list_dates_today(self):
+        now = int(time.time())
+        fresh = datetime.fromtimestamp(now - 3600, timezone.utc).isoformat()
+        stale = datetime.fromtimestamp(now - 3 * 86400, timezone.utc).isoformat()
+        board = {"provider": "greenhouse", "slug": "acme", "_baseline": True}
+
+        def fetch(url, data=None, board=None):
+            if url.endswith("/jobs"):
+                return {"jobs": [
+                    {"id": 1, "title": "Software Engineer, New Grad", "first_published": fresh},
+                    {"id": 2, "title": "Software Engineer", "first_published": stale},
+                    {"id": 3, "title": "Account Executive", "first_published": fresh},
+                ]}
+            return {"title": "Software Engineer, New Grad", "content": "<p>New grads.</p>",
+                    "location": {"name": "Austin, TX"}, "absolute_url": "https://example/1"}
+
+        with patch("job_watcher.fetch_json", side_effect=fetch) as fetch_json:
+            jobs = job_watcher.fetch_greenhouse_board(board, now)
+        self.assertEqual([job["id"] for job in jobs], ["greenhouse:acme:1"])
+        self.assertEqual(fetch_json.call_count, 2)
+        self.assertEqual(sorted(board["_listed_ids"]), ["1", "2", "3"])
 
     def test_first_poll_is_a_baseline_without_detail_calls(self):
         board = {"provider": "bamboohr", "slug": "acme", "_baseline": True}
